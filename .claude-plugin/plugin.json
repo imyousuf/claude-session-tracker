@@ -1,0 +1,6 @@
+{
+  "name": "session-tracker",
+  "version": "1.0.0",
+  "description": "Track and resume Claude Code sessions with an interactive TUI launcher",
+  "hooks": "./hooks/hooks.json"
+}

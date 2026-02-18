@@ -1,0 +1,285 @@
+name: Release Dev
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Test
+        run: make test-fast
+
+  build-linux-amd64:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Get version info
+        id: version
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          echo "version=dev-$SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "commit=${{ github.sha }}" >> $GITHUB_OUTPUT
+          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
+
+      - name: Build
+        run: |
+          mkdir -p dist
+          LDFLAGS="-s -w \
+            -X github.com/imyousuf/claude-session-tracker/cmd/cst.Version=${{ steps.version.outputs.version }} \
+            -X github.com/imyousuf/claude-session-tracker/cmd/cst.Commit=${{ steps.version.outputs.commit }} \
+            -X github.com/imyousuf/claude-session-tracker/cmd/cst.BuildDate=${{ steps.version.outputs.date }}"
+          CGO_ENABLED=0 go build -ldflags "$LDFLAGS" -o dist/cst ./cmd/cst
+          tar -czvf dist/cst-linux-amd64.tar.gz -C dist cst
+          rm dist/cst
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cst-linux-amd64
+          path: dist/cst-linux-amd64.tar.gz
+
+  build-linux-arm64:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Get version info
+        id: version
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          echo "version=dev-$SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "commit=${{ github.sha }}" >> $GITHUB_OUTPUT
+          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
+
+      - name: Build
+        env:
+          GOOS: linux
+          GOARCH: arm64
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p dist
+          LDFLAGS="-s -w \
+            -X github.com/imyousuf/claude-session-tracker/cmd/cst.Version=${{ steps.version.outputs.version }} \
+            -X github.com/imyousuf/claude-session-tracker/cmd/cst.Commit=${{ steps.version.outputs.commit }} \
+            -X github.com/imyousuf/claude-session-tracker/cmd/cst.BuildDate=${{ steps.version.outputs.date }}"
+          go build -ldflags "$LDFLAGS" -o dist/cst ./cmd/cst
+          tar -czvf dist/cst-linux-arm64.tar.gz -C dist cst
+          rm dist/cst
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cst-linux-arm64
+          path: dist/cst-linux-arm64.tar.gz
+
+  build-darwin-amd64:
+    needs: test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Get version info
+        id: version
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          echo "version=dev-$SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "commit=${{ github.sha }}" >> $GITHUB_OUTPUT
+          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
+
+      - name: Build
+        env:
+          GOOS: darwin
+          GOARCH: amd64
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p dist
+          LDFLAGS="-s -w \
+            -X github.com/imyousuf/claude-session-tracker/cmd/cst.Version=${{ steps.version.outputs.version }} \
+            -X github.com/imyousuf/claude-session-tracker/cmd/cst.Commit=${{ steps.version.outputs.commit }} \
+            -X github.com/imyousuf/claude-session-tracker/cmd/cst.BuildDate=${{ steps.version.outputs.date }}"
+          go build -ldflags "$LDFLAGS" -o dist/cst ./cmd/cst
+          tar -czvf dist/cst-darwin-amd64.tar.gz -C dist cst
+          rm dist/cst
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cst-darwin-amd64
+          path: dist/cst-darwin-amd64.tar.gz
+
+  build-darwin-arm64:
+    needs: test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Get version info
+        id: version
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          echo "version=dev-$SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "commit=${{ github.sha }}" >> $GITHUB_OUTPUT
+          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
+
+      - name: Build
+        env:
+          GOOS: darwin
+          GOARCH: arm64
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p dist
+          LDFLAGS="-s -w \
+            -X github.com/imyousuf/claude-session-tracker/cmd/cst.Version=${{ steps.version.outputs.version }} \
+            -X github.com/imyousuf/claude-session-tracker/cmd/cst.Commit=${{ steps.version.outputs.commit }} \
+            -X github.com/imyousuf/claude-session-tracker/cmd/cst.BuildDate=${{ steps.version.outputs.date }}"
+          go build -ldflags "$LDFLAGS" -o dist/cst ./cmd/cst
+          tar -czvf dist/cst-darwin-arm64.tar.gz -C dist cst
+          rm dist/cst
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cst-darwin-arm64
+          path: dist/cst-darwin-arm64.tar.gz
+
+  create-release:
+    needs:
+      - build-linux-amd64
+      - build-linux-arm64
+      - build-darwin-amd64
+      - build-darwin-arm64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get version info
+        id: version
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum *.tar.gz > checksums.txt
+          cat checksums.txt
+
+      - name: Delete existing dev release
+        run: |
+          gh release delete dev --yes || true
+          git push origin :refs/tags/dev || true
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Create dev release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: dev
+          name: Development Build (${{ steps.version.outputs.short_sha }})
+          body: |
+            ## Development Build
+
+            This is an automated development build from the `main` branch.
+
+            **Commit:** ${{ github.sha }}
+            **Date:** ${{ steps.version.outputs.date }}
+
+            ### Installation
+
+            Download the appropriate archive for your platform and extract the `cst` binary.
+
+            **Linux/macOS:**
+            ```bash
+            tar -xzf cst-<platform>.tar.gz
+            chmod +x cst
+            mv cst ~/.local/bin/  # or /usr/local/bin/
+            ```
+
+            ### Plugin Setup
+
+            After installing the binary, clone this repo and enable it as a Claude Code plugin:
+            ```bash
+            git clone https://github.com/imyousuf/claude-session-tracker.git
+            # Then in Claude Code, use /plugin to enable it
+            ```
+
+            ---
+
+            > **Note:** This is a development build and may contain unstable features.
+          files: |
+            dist/cst-linux-amd64.tar.gz
+            dist/cst-linux-arm64.tar.gz
+            dist/cst-darwin-amd64.tar.gz
+            dist/cst-darwin-arm64.tar.gz
+            dist/checksums.txt
+          prerelease: true
+          make_latest: false
