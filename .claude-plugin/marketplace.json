@@ -1,0 +1,16 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "claude-session-tracker",
+  "description": "Track and resume Claude Code sessions with an interactive TUI launcher",
+  "owner": {
+    "name": "imyousuf"
+  },
+  "plugins": [
+    {
+      "name": "session-tracker",
+      "source": "./",
+      "description": "Track Claude Code sessions via lifecycle hooks and resume them with a Bubbletea TUI",
+      "version": "1.0.0"
+    }
+  ]
+}
