@@ -15,7 +15,7 @@ func testStore(t *testing.T) *Store {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	t.Cleanup(func() { s.Close() })
+	t.Cleanup(func() { _ = s.Close() })
 	return s
 }
 
@@ -26,7 +26,7 @@ func TestOpenCreatesDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	if _, err := os.Stat(filepath.Join(dir, "sub", "dir")); err != nil {
 		t.Fatalf("directory not created: %v", err)

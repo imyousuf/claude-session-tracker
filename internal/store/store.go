@@ -78,13 +78,13 @@ func Open(dbPath string) (*Store, error) {
 	}
 
 	if err := db.Ping(); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("ping database: %w", err)
 	}
 
 	s := &Store{db: db}
 	if err := s.createTables(); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("create tables: %w", err)
 	}
 
@@ -190,7 +190,7 @@ func (s *Store) AddPrompt(sessionID, prompt string, ts int64) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	_, err = tx.Exec(`
 		INSERT INTO prompts (session_id, prompt, timestamp) VALUES (?, ?, ?)
@@ -254,7 +254,7 @@ func (s *Store) listSessions(query string, args ...any) ([]Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var sessions []Session
 	for rows.Next() {
@@ -295,7 +295,7 @@ func (s *Store) GetPrompts(sessionID string, limit int) ([]Prompt, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var prompts []Prompt
 	for rows.Next() {
@@ -346,7 +346,7 @@ func (s *Store) RefreshActive(isAlive func(pid int) bool) error {
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var toDeactivate []string
 	for rows.Next() {

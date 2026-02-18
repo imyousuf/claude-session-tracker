@@ -78,7 +78,7 @@ type promptsLoaded struct {
 func loadSessions(s *store.Store, project string, showAll bool) tea.Cmd {
 	return func() tea.Msg {
 		// Refresh active sessions first
-		s.RefreshActive(procutil.IsProcessAlive)
+		_ = s.RefreshActive(procutil.IsProcessAlive)
 
 		var sessions []store.Session
 		var err error
@@ -306,7 +306,7 @@ func (m Model) View() string {
 
 	// Status / search bar
 	if m.searching {
-		b.WriteString(fmt.Sprintf("Search: %s█", m.searchText))
+		fmt.Fprintf(&b, "Search: %s█", m.searchText)
 	} else if m.statusMsg != "" {
 		if m.confirming {
 			b.WriteString(errorStyle.Render(m.statusMsg))
