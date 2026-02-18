@@ -1,14 +1,17 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"syscall"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/spf13/cobra"
 
+	"github.com/imyousuf/claude-session-tracker/internal/config"
 	"github.com/imyousuf/claude-session-tracker/internal/hook"
 	"github.com/imyousuf/claude-session-tracker/internal/launcher"
 	"github.com/imyousuf/claude-session-tracker/internal/store"
@@ -35,10 +38,11 @@ var (
 )
 
 var rootCmd = &cobra.Command{
-	Use:   "cst",
+	Use:   "cst [-- claude-args...]",
 	Short: "Claude Session Tracker - track and resume Claude Code sessions",
-	Long:  "A tool that tracks Claude Code sessions via lifecycle hooks and provides a TUI launcher to browse and resume previous sessions.",
+	Long:  "A tool that tracks Claude Code sessions via lifecycle hooks and provides a TUI launcher to browse and resume previous sessions.\n\nAny arguments after -- are passed through to the claude CLI on resume.",
 	RunE:  launchTUI,
+	Args:  cobra.ArbitraryArgs,
 }
 
 func init() {
@@ -47,6 +51,7 @@ func init() {
 	rootCmd.AddCommand(listCmd)
 	rootCmd.AddCommand(cleanupCmd)
 	rootCmd.AddCommand(versionCmd)
+	rootCmd.AddCommand(configCmd)
 
 	// Launch flags (also on root)
 	rootCmd.Flags().BoolVarP(&flagAll, "all", "a", false, "Show sessions from all projects")
@@ -152,21 +157,34 @@ func launchTUI(cmd *cobra.Command, args []string) error {
 		return nil // User quit without selecting
 	}
 
-	// Resume the selected session
-	fmt.Printf("Resuming session %s...\n", result.SessionID[:8])
+	return resumeSession(result.SessionID, result.Project, args)
+}
 
-	// Change to the project directory
-	if err := os.Chdir(result.Project); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: could not cd to %s: %v\n", result.Project, err)
+func resumeSession(sessionID, project string, extraArgs []string) error {
+	// Load config for additional claude args
+	cfg, err := config.Load(config.DefaultConfigPath())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not load config: %v\n", err)
 	}
 
-	// Exec claude --resume
+	// Build claude command: claude --resume <id> [config args] [-- extra args]
+	claudeArgs := []string{"claude", "--resume", sessionID}
+	claudeArgs = append(claudeArgs, cfg.ClaudeArgs()...)
+	claudeArgs = append(claudeArgs, extraArgs...)
+
+	fmt.Printf("Resuming session %s...\n", sessionID[:8])
+
+	// Change to the project directory
+	if err := os.Chdir(project); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not cd to %s: %v\n", project, err)
+	}
+
 	claudeBin, err := exec.LookPath("claude")
 	if err != nil {
 		return fmt.Errorf("claude not found in PATH: %w", err)
 	}
 
-	return syscall.Exec(claudeBin, []string{"claude", "--resume", result.SessionID}, os.Environ())
+	return syscall.Exec(claudeBin, claudeArgs, os.Environ())
 }
 
 // --- List Command ---
@@ -300,6 +318,85 @@ var cleanupCmd = &cobra.Command{
 		fmt.Printf("Removed %d inactive sessions older than %d days.\n", removed, flagDays)
 		return nil
 	},
+}
+
+// --- Config Command ---
+
+var configCmd = &cobra.Command{
+	Use:   "config",
+	Short: "View or modify CST configuration",
+	Long:  "View or modify CST configuration stored in ~/.cst/config.json.",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		cfg, err := config.Load(config.DefaultConfigPath())
+		if err != nil {
+			return err
+		}
+		data, err := json.MarshalIndent(cfg, "", "  ")
+		if err != nil {
+			return err
+		}
+		fmt.Println(string(data))
+		fmt.Printf("\nConfig path: %s\n", config.DefaultConfigPath())
+		return nil
+	},
+}
+
+var configSetCmd = &cobra.Command{
+	Use:   "set <key> <value>",
+	Short: "Set a config value",
+	Long: `Set a configuration value. Available keys:
+  dangerously_skip_permissions  (true/false) - Always pass --dangerously-skip-permissions to claude
+  extra_args                    (comma-separated) - Additional args to pass to claude on resume`,
+	Args: cobra.ExactArgs(2),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		cfgPath := config.DefaultConfigPath()
+		cfg, err := config.Load(cfgPath)
+		if err != nil {
+			return err
+		}
+
+		key, value := args[0], args[1]
+		switch key {
+		case "dangerously_skip_permissions":
+			switch value {
+			case "true":
+				cfg.DangerouslySkipPermissions = true
+			case "false":
+				cfg.DangerouslySkipPermissions = false
+			default:
+				return fmt.Errorf("invalid value %q for %s, expected true or false", value, key)
+			}
+		case "extra_args":
+			if value == "" || value == "[]" {
+				cfg.ExtraArgs = nil
+			} else {
+				cfg.ExtraArgs = splitArgs(value)
+			}
+		default:
+			return fmt.Errorf("unknown config key: %q\nAvailable: dangerously_skip_permissions, extra_args", key)
+		}
+
+		if err := config.Save(cfgPath, cfg); err != nil {
+			return err
+		}
+		fmt.Printf("Set %s = %s\n", key, value)
+		return nil
+	},
+}
+
+func splitArgs(s string) []string {
+	var args []string
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			args = append(args, part)
+		}
+	}
+	return args
+}
+
+func init() {
+	configCmd.AddCommand(configSetCmd)
 }
 
 // --- Version Command ---
