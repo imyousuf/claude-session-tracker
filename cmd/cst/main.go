@@ -114,7 +114,7 @@ func runHook(handler func(*store.Store, hook.HookInput) error) error {
 	if err != nil {
 		return err
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	return handler(s, input)
 }
@@ -142,7 +142,7 @@ func launchTUI(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	m := launcher.New(s, project, flagAll)
 	p := tea.NewProgram(m, tea.WithAltScreen())
@@ -207,7 +207,7 @@ var listCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		defer s.Close()
+		defer func() { _ = s.Close() }()
 
 		var sessions []store.Session
 		if flagAll || project == "" {
@@ -308,7 +308,7 @@ var cleanupCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		defer s.Close()
+		defer func() { _ = s.Close() }()
 
 		removed, err := s.Cleanup(flagDays)
 		if err != nil {
