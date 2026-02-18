@@ -131,6 +131,7 @@ func launchTUI(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("get working directory: %w", err)
 		}
 	}
+	project = store.ResolvePath(project)
 
 	s, err := store.Open(store.DefaultDBPath())
 	if err != nil {
@@ -182,6 +183,7 @@ var listCmd = &cobra.Command{
 				return err
 			}
 		}
+		project = store.ResolvePath(project)
 
 		s, err := store.Open(store.DefaultDBPath())
 		if err != nil {

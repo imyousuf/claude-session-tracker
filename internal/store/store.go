@@ -45,6 +45,16 @@ type Store struct {
 	db *sql.DB
 }
 
+// ResolvePath resolves symlinks to get the canonical path.
+// Falls back to the original path if resolution fails.
+func ResolvePath(p string) string {
+	resolved, err := filepath.EvalSymlinks(p)
+	if err != nil {
+		return p
+	}
+	return resolved
+}
+
 // DefaultDBPath returns the default database path (~/.cst/sessions.db).
 func DefaultDBPath() string {
 	home, err := os.UserHomeDir()
@@ -115,11 +125,14 @@ func (s *Store) Close() error {
 }
 
 // UpsertSession inserts a new session or updates an existing one.
+// Paths are resolved to their canonical form to handle symlinks.
 func (s *Store) UpsertSession(sess Session) error {
 	active := 0
 	if sess.Active {
 		active = 1
 	}
+	project := ResolvePath(sess.Project)
+	cwd := ResolvePath(sess.CWD)
 	_, err := s.db.Exec(`
 		INSERT INTO sessions (id, project, cwd, started_at, last_activity, pid, active, model)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -129,17 +142,18 @@ func (s *Store) UpsertSession(sess Session) error {
 			pid = excluded.pid,
 			active = excluded.active,
 			model = excluded.model
-	`, sess.ID, sess.Project, sess.CWD, sess.StartedAt, sess.LastActivity, sess.PID, active, sess.Model)
+	`, sess.ID, project, cwd, sess.StartedAt, sess.LastActivity, sess.PID, active, sess.Model)
 	return err
 }
 
 // Activate marks a session as active and updates its PID, model, cwd, and last_activity.
 func (s *Store) Activate(id string, pid int, model, cwd string) error {
 	now := time.Now().UnixMilli()
+	resolvedCWD := ResolvePath(cwd)
 	result, err := s.db.Exec(`
 		UPDATE sessions SET active = 1, pid = ?, model = ?, cwd = ?, last_activity = ?
 		WHERE id = ?
-	`, pid, model, cwd, now, id)
+	`, pid, model, resolvedCWD, now, id)
 	if err != nil {
 		return err
 	}
@@ -163,9 +177,10 @@ func (s *Store) Deactivate(id string) error {
 
 // UpdateActivity updates the last_activity timestamp and cwd for a session.
 func (s *Store) UpdateActivity(id, cwd string, ts int64) error {
+	resolvedCWD := ResolvePath(cwd)
 	_, err := s.db.Exec(`
 		UPDATE sessions SET last_activity = ?, cwd = ? WHERE id = ?
-	`, ts, cwd, id)
+	`, ts, resolvedCWD, id)
 	return err
 }
 
@@ -202,7 +217,9 @@ func (s *Store) AddPrompt(sessionID, prompt string, ts int64) error {
 
 // ListByProject returns sessions for a given project, ordered by last_activity DESC.
 // Each session includes the most recent prompt text and timestamp.
+// The project path is resolved to its canonical form to handle symlinks.
 func (s *Store) ListByProject(project string) ([]Session, error) {
+	resolved := ResolvePath(project)
 	return s.listSessions(`
 		SELECT s.id, s.project, s.cwd, s.started_at, s.last_activity, s.pid, s.active, s.model,
 			COALESCE(p.prompt, ''), p.timestamp
@@ -214,7 +231,7 @@ func (s *Store) ListByProject(project string) ([]Session, error) {
 		) p ON p.session_id = s.id AND p.rn = 1
 		WHERE s.project = ?
 		ORDER BY s.last_activity DESC
-	`, project)
+	`, resolved)
 }
 
 // ListAll returns all sessions, ordered by last_activity DESC.
