@@ -1,0 +1,282 @@
+package daemon
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/imyousuf/claude-session-tracker/internal/snapshot"
+	"github.com/imyousuf/claude-session-tracker/internal/store"
+	"github.com/imyousuf/claude-session-tracker/internal/wezterm"
+)
+
+// Default tuning constants. Exposed for tests.
+const (
+	DefaultCoalesceWindow = 100 * time.Millisecond
+	DefaultIdleTimeout    = 30 * time.Minute
+)
+
+// Options configures a Daemon.
+type Options struct {
+	SocketPath     string
+	WezStorePath   string
+	SessionsDBPath string // optional; if set, ATTACHed for future cross-DB queries
+	CoalesceWindow time.Duration
+	IdleTimeout    time.Duration
+	Logger         *log.Logger
+}
+
+// Daemon owns the wezterm.db connection and serves the per-user event socket.
+type Daemon struct {
+	opts Options
+	w    *store.WezStore
+	log  *log.Logger
+}
+
+// New creates a Daemon with sensible defaults filled in.
+func New(opts Options) (*Daemon, error) {
+	if opts.SocketPath == "" {
+		opts.SocketPath = SocketPath()
+	}
+	if opts.WezStorePath == "" {
+		opts.WezStorePath = store.DefaultWezDBPath()
+	}
+	if opts.CoalesceWindow <= 0 {
+		opts.CoalesceWindow = DefaultCoalesceWindow
+	}
+	if opts.IdleTimeout <= 0 {
+		opts.IdleTimeout = DefaultIdleTimeout
+	}
+	if opts.Logger == nil {
+		opts.Logger = log.New(os.Stderr, "[cst-daemon] ", log.LstdFlags|log.Lmicroseconds)
+	}
+
+	w, err := store.OpenWez(opts.WezStorePath)
+	if err != nil {
+		return nil, fmt.Errorf("open wezterm.db: %w", err)
+	}
+	if opts.SessionsDBPath != "" {
+		if _, statErr := os.Stat(opts.SessionsDBPath); statErr == nil {
+			if err := w.AttachSessionsDB(opts.SessionsDBPath); err != nil {
+				opts.Logger.Printf("warn: AttachSessionsDB failed: %v", err)
+			}
+		}
+	}
+	return &Daemon{opts: opts, w: w, log: opts.Logger}, nil
+}
+
+// Close releases the WezStore connection.
+func (d *Daemon) Close() error {
+	return d.w.Close()
+}
+
+// Serve binds the socket and runs the event loop until ctx is canceled,
+// SIGTERM/SIGINT arrives, or the idle timeout fires.
+//
+// Refuses to start if the socket is already bound — defense against a second
+// daemon clobbering the live one. Caller is responsible for shipping a PID
+// file (use WritePIDFile from socket.go).
+func (d *Daemon) Serve(ctx context.Context) error {
+	if err := CheckSocketDirOwnership(d.opts.SocketPath); err != nil {
+		return err
+	}
+	// Remove any stale socket file; if a live daemon owns it, bind will fail.
+	_ = os.Remove(d.opts.SocketPath)
+
+	lc := net.ListenConfig{}
+	listener, err := lc.Listen(ctx, "unix", d.opts.SocketPath)
+	if err != nil {
+		return fmt.Errorf("listen %s: %w", d.opts.SocketPath, err)
+	}
+	defer func() { _ = listener.Close() }()
+	// Tighten perms so only the owning user can connect.
+	_ = os.Chmod(d.opts.SocketPath, 0o600)
+	d.log.Printf("daemon listening on %s", d.opts.SocketPath)
+
+	events := make(chan Event, 256)
+	var connWg sync.WaitGroup
+
+	// Accept loop.
+	go func() {
+		<-ctx.Done()
+		_ = listener.Close()
+	}()
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				if errors.Is(err, net.ErrClosed) {
+					return
+				}
+				d.log.Printf("accept: %v", err)
+				continue
+			}
+			connWg.Add(1)
+			go d.handleConn(conn, events, &connWg)
+		}
+	}()
+
+	return d.eventLoop(ctx, events, &connWg)
+}
+
+// handleConn reads NDJSON events from one client connection until EOF.
+func (d *Daemon) handleConn(conn net.Conn, events chan<- Event, wg *sync.WaitGroup) {
+	defer wg.Done()
+	defer func() { _ = conn.Close() }()
+	next := ReadEvents(conn)
+	for {
+		ev, err := next()
+		if err == io.EOF {
+			return
+		}
+		if err != nil {
+			d.log.Printf("read event: %v", err)
+			return
+		}
+		select {
+		case events <- ev:
+		default:
+			// Channel full — drop and warn (extremely unlikely; buffer is 256).
+			d.log.Printf("event channel full; dropping %s", ev.Type)
+		}
+	}
+}
+
+// eventLoop is the core daemon goroutine. Coalesces snapshot requests;
+// applies preexec/precmd/session events immediately.
+func (d *Daemon) eventLoop(ctx context.Context, events <-chan Event, wg *sync.WaitGroup) error {
+	coalesce := time.NewTimer(time.Hour)
+	coalesce.Stop()
+	snapshotPending := false
+
+	idle := time.NewTimer(d.opts.IdleTimeout)
+	defer idle.Stop()
+
+	resetIdle := func() {
+		if !idle.Stop() {
+			select {
+			case <-idle.C:
+			default:
+			}
+		}
+		idle.Reset(d.opts.IdleTimeout)
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			d.log.Printf("context done; draining")
+			wg.Wait()
+			return nil
+
+		case <-idle.C:
+			d.log.Printf("idle timeout (%s); exiting", d.opts.IdleTimeout)
+			return nil
+
+		case ev := <-events:
+			resetIdle()
+			d.dispatch(ev, &snapshotPending, coalesce)
+
+		case <-coalesce.C:
+			if snapshotPending {
+				snapshotPending = false
+				d.runSnapshot()
+			}
+		}
+	}
+}
+
+func (d *Daemon) dispatch(ev Event, pending *bool, coalesce *time.Timer) {
+	switch ev.Type {
+	case EventSnapshotRequest, EventSessionStart, EventSessionEnd:
+		// Schedule a snapshot via the coalesce window.
+		if !*pending {
+			*pending = true
+			coalesce.Reset(d.opts.CoalesceWindow)
+		}
+		// SessionStart/End also have their own immediate state writes:
+		if ev.Type == EventSessionStart {
+			d.applySessionStart(ev)
+		} else if ev.Type == EventSessionEnd {
+			d.applySessionEnd(ev)
+		}
+
+	case EventPreexec:
+		d.applyPreexec(ev)
+
+	case EventPrecmd:
+		d.applyPrecmd(ev)
+
+	case EventShutdown:
+		// Best-effort: trigger a final snapshot synchronously, then exit.
+		if *pending {
+			*pending = false
+			coalesce.Stop()
+		}
+		d.runSnapshot()
+
+	default:
+		d.log.Printf("unknown event type: %q", ev.Type)
+	}
+}
+
+func (d *Daemon) applyPreexec(ev Event) {
+	if ev.MuxSocket == "" || ev.PaneID == 0 || ev.Command == "" {
+		return
+	}
+	if err := d.w.ApplyPreexec(ev.MuxSocket, ev.PaneID, ev.Command, ev.CWD, ev.Timestamp); err != nil {
+		d.log.Printf("ApplyPreexec: %v", err)
+	}
+}
+
+func (d *Daemon) applyPrecmd(ev Event) {
+	if ev.MuxSocket == "" || ev.PaneID == 0 {
+		return
+	}
+	if err := d.w.ApplyPrecmd(ev.MuxSocket, ev.PaneID, ev.CWD, ev.Timestamp); err != nil {
+		d.log.Printf("ApplyPrecmd: %v", err)
+	}
+}
+
+func (d *Daemon) applySessionStart(ev Event) {
+	if ev.MuxSocket == "" || ev.PaneID == 0 || ev.SessionID == "" {
+		return
+	}
+	if err := d.w.BindClaudeSession(ev.MuxSocket, ev.PaneID, ev.SessionID, ev.CWD); err != nil {
+		d.log.Printf("BindClaudeSession: %v", err)
+	}
+}
+
+func (d *Daemon) applySessionEnd(ev Event) {
+	if ev.MuxSocket == "" || ev.PaneID == 0 {
+		return
+	}
+	if err := d.w.UnbindClaudeSession(ev.MuxSocket, ev.PaneID); err != nil {
+		d.log.Printf("UnbindClaudeSession: %v", err)
+	}
+}
+
+// runSnapshot calls `wezterm cli list` and syncs the result into the store.
+// Errors are logged but not propagated — the daemon stays alive.
+func (d *Daemon) runSnapshot() {
+	raw, panes, err := wezterm.ListWithRaw()
+	if err != nil {
+		d.log.Printf("wezterm list: %v", err)
+		return
+	}
+	res, err := snapshot.Sync(d.w, raw, panes, wezterm.MuxSocket(), time.Now())
+	if err != nil {
+		d.log.Printf("Sync: %v", err)
+		return
+	}
+	if res.DidWork {
+		d.log.Printf("snapshot: %d windows, %d tabs, %d panes (%d runtime pruned)",
+			res.WindowsWritten, res.TabsWritten, res.PanesWritten, res.RuntimePruned)
+	}
+}

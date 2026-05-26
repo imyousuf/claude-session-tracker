@@ -19,6 +19,66 @@ type Config struct {
 
 	// ExtraArgs are additional arguments always passed to the claude CLI on resume.
 	ExtraArgs []string `json:"extra_args,omitempty"`
+
+	// ReplayCommands is the allow-list of command names whose last invocation
+	// `cst restore` will re-launch in each pane that was running them. The
+	// captured full command line (including args) is replayed verbatim.
+	// `claude` is a special case: if a session ID is linked to the pane,
+	// `claude --resume <id>` is spawned instead of the literal capture.
+	//
+	// OOTB defaults: "claude", "tomoe". Users can add more with
+	// `cst config replay-add <name>` and remove with `replay-remove <name>`.
+	ReplayCommands []string `json:"replay_commands,omitempty"`
+}
+
+// Defaults returns the OOTB Config — used to seed a fresh ~/.cst/config.json
+// and to merge missing values into an existing config.
+func Defaults() Config {
+	return Config{
+		ReplayCommands: []string{"claude", "tomoe"},
+	}
+}
+
+// WithDefaults returns a copy of c with any unset list-style fields filled in
+// from Defaults(). Specifically, if ReplayCommands is nil it gets the defaults;
+// if it's an empty slice (user explicitly set [] to opt out) it stays empty.
+func (c Config) WithDefaults() Config {
+	if c.ReplayCommands == nil {
+		c.ReplayCommands = Defaults().ReplayCommands
+	}
+	return c
+}
+
+// AddReplayCommand appends name to ReplayCommands if not already present.
+// Returns true if added, false if it was already in the list.
+func (c *Config) AddReplayCommand(name string) bool {
+	for _, n := range c.ReplayCommands {
+		if n == name {
+			return false
+		}
+	}
+	c.ReplayCommands = append(c.ReplayCommands, name)
+	return true
+}
+
+// RemoveReplayCommand drops name from ReplayCommands. Returns true if present.
+// To distinguish "user explicitly opted out of OOTB defaults" from "user has
+// never touched the list" downstream, this method writes an empty slice (not nil)
+// when the last entry is removed.
+func (c *Config) RemoveReplayCommand(name string) bool {
+	out := make([]string, 0, len(c.ReplayCommands))
+	removed := false
+	for _, n := range c.ReplayCommands {
+		if n == name {
+			removed = true
+			continue
+		}
+		out = append(out, n)
+	}
+	if removed {
+		c.ReplayCommands = out
+	}
+	return removed
 }
 
 // DefaultConfigPath returns the path to ~/.cst/config.json.
