@@ -205,6 +205,39 @@ func TestApplyPreexecAndPrecmd(t *testing.T) {
 	}
 }
 
+func TestInferMuxSocketEmptyWhenNoRuntime(t *testing.T) {
+	w := testWezStore(t)
+	sock, err := w.InferMuxSocket()
+	if err != nil {
+		t.Fatalf("InferMuxSocket: %v", err)
+	}
+	if sock != "" {
+		t.Errorf("expected empty, got %q", sock)
+	}
+}
+
+func TestInferMuxSocketReturnsMostRecent(t *testing.T) {
+	w := testWezStore(t)
+	// Seed two mux sockets at different times. Most-recent should win.
+	if err := w.ApplyPreexec("/run/mux-A", 1, "cmd-A", "/tmp", 100); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.ApplyPreexec("/run/mux-B", 1, "cmd-B", "/tmp", 200); err != nil {
+		t.Fatal(err)
+	}
+	// Finish mux-A's command — that gives it a last_finished_at > both.
+	if err := w.ApplyPrecmd("/run/mux-A", 1, "/tmp", 300); err != nil {
+		t.Fatal(err)
+	}
+	sock, err := w.InferMuxSocket()
+	if err != nil {
+		t.Fatalf("InferMuxSocket: %v", err)
+	}
+	if sock != "/run/mux-A" {
+		t.Errorf("expected /run/mux-A (most recent), got %q", sock)
+	}
+}
+
 func TestPruneDeadMux(t *testing.T) {
 	w := testWezStore(t)
 	for _, sock := range []string{"/run/mux-1", "/run/mux-2"} {

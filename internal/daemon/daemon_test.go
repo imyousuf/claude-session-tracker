@@ -254,6 +254,68 @@ func TestDaemonIdleExit(t *testing.T) {
 	}
 }
 
+func TestDaemonResolveMuxSocketFromEventCache(t *testing.T) {
+	// Clear $WEZTERM_UNIX_SOCKET so the env-var branch doesn't short-circuit
+	// (the test process may itself be running inside wezterm).
+	t.Setenv("WEZTERM_UNIX_SOCKET", "")
+
+	d, _, sock := setupDaemon(t, 50*time.Millisecond)
+	cancel := startDaemonGoroutine(t, d)
+	defer cancel()
+
+	// Initially the cache is empty and no runtime rows exist.
+	if got := d.resolveMuxSocket(); got != "" {
+		t.Errorf("expected empty before any event, got %q", got)
+	}
+
+	// Push a preexec event; the daemon should remember the mux socket.
+	pushTo(t, sock, Event{
+		Type: EventPreexec, MuxSocket: "/run/wez-mux-42", PaneID: 7,
+		Command: "claude", CWD: "/tmp", Timestamp: 1000,
+	})
+
+	// Wait for the event to be applied.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if d.cachedMuxSocket() == "/run/wez-mux-42" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := d.resolveMuxSocket(); got != "/run/wez-mux-42" {
+		t.Errorf("resolveMuxSocket = %q, want %q", got, "/run/wez-mux-42")
+	}
+}
+
+func TestDaemonResolveMuxSocketFallbackToDB(t *testing.T) {
+	// Clear $WEZTERM_UNIX_SOCKET so the env-var branch in resolveMuxSocket
+	// doesn't short-circuit (the test process may itself be running inside
+	// wezterm).
+	t.Setenv("WEZTERM_UNIX_SOCKET", "")
+
+	d, _, _ := setupDaemon(t, 50*time.Millisecond)
+	// Don't start Serve — we just want to test resolveMuxSocket against the store directly.
+
+	// Seed pane_runtime_state directly (simulating an earlier event from a
+	// previous daemon run).
+	if err := d.w.ApplyPreexec("/run/persisted-mux", 9, "old", "/tmp", 999); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// Cache is empty (no events have arrived this run), env is empty.
+	if d.cachedMuxSocket() != "" {
+		t.Fatal("test setup: cache should be empty")
+	}
+	got := d.resolveMuxSocket()
+	if got != "/run/persisted-mux" {
+		t.Errorf("expected fallback to DB, got %q", got)
+	}
+	// Should be cached now.
+	if d.cachedMuxSocket() != "/run/persisted-mux" {
+		t.Errorf("inferred value not cached: %q", d.cachedMuxSocket())
+	}
+}
+
 func TestDaemonWithSessionsDBAttach(t *testing.T) {
 	dir := t.TempDir()
 

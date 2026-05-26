@@ -343,6 +343,29 @@ func (w *WezStore) LookupPaneRuntime(muxSocket string, paneID int64) (PaneRuntim
 	return s, true, nil
 }
 
+// InferMuxSocket returns the mux_socket of the most-recently-touched
+// pane_runtime_state row. Used by the daemon to discover the wezterm mux
+// socket when its own env doesn't have $WEZTERM_UNIX_SOCKET (e.g. when the
+// daemon is started by systemd-user, which inherits no wezterm env vars).
+//
+// Returns "" with nil error if no runtime state exists yet.
+func (w *WezStore) InferMuxSocket() (string, error) {
+	var sock string
+	err := w.db.QueryRow(`
+		SELECT mux_socket
+		FROM pane_runtime_state
+		ORDER BY COALESCE(last_finished_at, current_started_at, 0) DESC
+		LIMIT 1
+	`).Scan(&sock)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return sock, nil
+}
+
 // PruneDeadMux deletes all pane_runtime_state rows belonging to a mux socket
 // that no longer exists. Called by the daemon when it detects a dead socket.
 func (w *WezStore) PruneDeadMux(muxSocket string) (int, error) {

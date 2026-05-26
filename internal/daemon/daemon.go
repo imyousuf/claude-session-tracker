@@ -37,6 +37,12 @@ type Daemon struct {
 	opts Options
 	w    *store.WezStore
 	log  *log.Logger
+
+	// muxSocketMu guards lastMuxSocket — set from incoming events so that
+	// snapshot runs can derive the mux even when the daemon's own env doesn't
+	// have $WEZTERM_UNIX_SOCKET (e.g. when started by systemd-user).
+	muxSocketMu    sync.Mutex
+	lastMuxSocket  string
 }
 
 // New creates a Daemon with sensible defaults filled in.
@@ -226,10 +232,29 @@ func (d *Daemon) dispatch(ev Event, pending *bool, coalesce *time.Timer) {
 	}
 }
 
+// rememberMuxSocket caches the mux socket from any incoming event, so that
+// later snapshots can use it even if the daemon's own env doesn't carry
+// $WEZTERM_UNIX_SOCKET.
+func (d *Daemon) rememberMuxSocket(sock string) {
+	if sock == "" {
+		return
+	}
+	d.muxSocketMu.Lock()
+	d.lastMuxSocket = sock
+	d.muxSocketMu.Unlock()
+}
+
+func (d *Daemon) cachedMuxSocket() string {
+	d.muxSocketMu.Lock()
+	defer d.muxSocketMu.Unlock()
+	return d.lastMuxSocket
+}
+
 func (d *Daemon) applyPreexec(ev Event) {
 	if ev.MuxSocket == "" || ev.PaneID == 0 || ev.Command == "" {
 		return
 	}
+	d.rememberMuxSocket(ev.MuxSocket)
 	if err := d.w.ApplyPreexec(ev.MuxSocket, ev.PaneID, ev.Command, ev.CWD, ev.Timestamp); err != nil {
 		d.log.Printf("ApplyPreexec: %v", err)
 	}
@@ -239,6 +264,7 @@ func (d *Daemon) applyPrecmd(ev Event) {
 	if ev.MuxSocket == "" || ev.PaneID == 0 {
 		return
 	}
+	d.rememberMuxSocket(ev.MuxSocket)
 	if err := d.w.ApplyPrecmd(ev.MuxSocket, ev.PaneID, ev.CWD, ev.Timestamp); err != nil {
 		d.log.Printf("ApplyPrecmd: %v", err)
 	}
@@ -248,6 +274,7 @@ func (d *Daemon) applySessionStart(ev Event) {
 	if ev.MuxSocket == "" || ev.PaneID == 0 || ev.SessionID == "" {
 		return
 	}
+	d.rememberMuxSocket(ev.MuxSocket)
 	if err := d.w.BindClaudeSession(ev.MuxSocket, ev.PaneID, ev.SessionID, ev.CWD); err != nil {
 		d.log.Printf("BindClaudeSession: %v", err)
 	}
@@ -257,6 +284,7 @@ func (d *Daemon) applySessionEnd(ev Event) {
 	if ev.MuxSocket == "" || ev.PaneID == 0 {
 		return
 	}
+	d.rememberMuxSocket(ev.MuxSocket)
 	if err := d.w.UnbindClaudeSession(ev.MuxSocket, ev.PaneID); err != nil {
 		d.log.Printf("UnbindClaudeSession: %v", err)
 	}
@@ -270,7 +298,7 @@ func (d *Daemon) runSnapshot() {
 		d.log.Printf("wezterm list: %v", err)
 		return
 	}
-	res, err := snapshot.Sync(d.w, raw, panes, wezterm.MuxSocket(), time.Now())
+	res, err := snapshot.Sync(d.w, raw, panes, d.resolveMuxSocket(), time.Now())
 	if err != nil {
 		d.log.Printf("Sync: %v", err)
 		return
@@ -279,4 +307,26 @@ func (d *Daemon) runSnapshot() {
 		d.log.Printf("snapshot: %d windows, %d tabs, %d panes (%d runtime pruned)",
 			res.WindowsWritten, res.TabsWritten, res.PanesWritten, res.RuntimePruned)
 	}
+}
+
+// resolveMuxSocket returns the wezterm mux socket path the snapshot should use
+// when joining pane_runtime_state. Tries in order:
+//  1. Daemon's own env ($WEZTERM_UNIX_SOCKET) — only set if the daemon was
+//     started from inside a wezterm pane (rare in production).
+//  2. Cached value from the most-recent incoming event (preexec/precmd/session).
+//  3. Inferred from pane_runtime_state in the DB (most-recently-touched row).
+//  4. Empty — snapshot still runs; just skips the join + runtime prune.
+func (d *Daemon) resolveMuxSocket() string {
+	if s := wezterm.MuxSocket(); s != "" {
+		return s
+	}
+	if s := d.cachedMuxSocket(); s != "" {
+		return s
+	}
+	if s, err := d.w.InferMuxSocket(); err == nil && s != "" {
+		// Cache the inferred value so we don't re-query every snapshot.
+		d.rememberMuxSocket(s)
+		return s
+	}
+	return ""
 }
