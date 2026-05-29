@@ -41,8 +41,8 @@ type Daemon struct {
 	// muxSocketMu guards lastMuxSocket — set from incoming events so that
 	// snapshot runs can derive the mux even when the daemon's own env doesn't
 	// have $WEZTERM_UNIX_SOCKET (e.g. when started by systemd-user).
-	muxSocketMu    sync.Mutex
-	lastMuxSocket  string
+	muxSocketMu   sync.Mutex
+	lastMuxSocket string
 }
 
 // New creates a Daemon with sensible defaults filled in.
@@ -209,7 +209,8 @@ func (d *Daemon) dispatch(ev Event, pending *bool, coalesce *time.Timer) {
 		// SessionStart/End also have their own immediate state writes:
 		if ev.Type == EventSessionStart {
 			d.applySessionStart(ev)
-		} else if ev.Type == EventSessionEnd {
+		}
+		if ev.Type == EventSessionEnd {
 			d.applySessionEnd(ev)
 		}
 

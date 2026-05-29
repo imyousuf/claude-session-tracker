@@ -21,11 +21,11 @@ type fakeSpawner struct {
 }
 
 type spawnCall struct {
-	Kind     string // "new-window" | "tab" | "lookup"
+	Kind     string // "new-window" | "tab" | "split" | "lookup"
 	WindowID int64
 	CWD      string
 	Command  []string
-	PaneID   int64 // for "lookup"
+	PaneID   int64 // for "lookup" and "split" (the pane being split off)
 }
 
 func newFakeSpawner() *fakeSpawner {
@@ -48,6 +48,13 @@ func (f *fakeSpawner) SpawnTabInWindow(windowID int64, cwd string, cmd []string)
 	pid := f.nextPaneID
 	f.nextPaneID++
 	f.calls = append(f.calls, spawnCall{Kind: "tab", WindowID: windowID, CWD: cwd, Command: cmd, PaneID: pid})
+	return pid, nil
+}
+
+func (f *fakeSpawner) SplitPane(paneID int64, cwd string, cmd []string) (int64, error) {
+	pid := f.nextPaneID
+	f.nextPaneID++
+	f.calls = append(f.calls, spawnCall{Kind: "split", CWD: cwd, Command: cmd, PaneID: paneID})
 	return pid, nil
 }
 
@@ -116,8 +123,11 @@ func TestRestoreDryRun(t *testing.T) {
 	if res.WindowsSpawned != 2 {
 		t.Errorf("windows = %d, want 2", res.WindowsSpawned)
 	}
-	if res.TabsSpawned != 2 {
-		t.Errorf("tabs = %d, want 2 (one tab + one flattened split)", res.TabsSpawned)
+	if res.TabsSpawned != 1 {
+		t.Errorf("tabs = %d, want 1 (window 1's second tab)", res.TabsSpawned)
+	}
+	if res.PanesSplit != 1 {
+		t.Errorf("splits = %d, want 1 (the second pane of the two-pane tab)", res.PanesSplit)
 	}
 
 	// Output should mention claude --resume abc and tomoe start.
@@ -142,7 +152,7 @@ func TestRestoreExecutesPlannedSpawns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
-	if res.WindowsSpawned != 2 || res.TabsSpawned != 2 {
+	if res.WindowsSpawned != 2 || res.TabsSpawned != 1 || res.PanesSplit != 1 {
 		t.Errorf("res = %+v", res)
 	}
 
@@ -200,21 +210,17 @@ func TestRestoreUnknownCommandGetsPlainShell(t *testing.T) {
 		t.Fatalf("Restore: %v", err)
 	}
 
-	// Find the call corresponding to pane 12 (vim). It should have empty Command
-	// (plain shell). Pane 12 is the "tab spawn" for window 1's second tab's
-	// second pane (flattened to a tab).
+	// Pane 12 (vim) is the second pane of window 1's two-pane tab, so it is
+	// restored as a split off the tab's lead pane. vim isn't in the registry,
+	// so it should get a plain shell (empty command).
 	var vimCall *spawnCall
 	for i := range f.calls {
-		if f.calls[i].Kind == "tab" && f.calls[i].CWD == "/proj/edit" {
-			if vimCall == nil {
-				vimCall = &f.calls[i] // first match is pane 11 (no runtime)
-			} else {
-				vimCall = &f.calls[i] // second match is pane 12 (vim)
-			}
+		if f.calls[i].Kind == "split" && f.calls[i].CWD == "/proj/edit" {
+			vimCall = &f.calls[i]
 		}
 	}
 	if vimCall == nil {
-		t.Fatal("no spawn for vim pane found")
+		t.Fatal("no split for vim pane found")
 	}
 	if len(vimCall.Command) != 0 {
 		t.Errorf("vim pane should get plain shell, got command = %v", vimCall.Command)
@@ -226,12 +232,52 @@ func TestRestoreMissingDBIsNotAnError(t *testing.T) {
 	res, err := Restore(context.Background(), RestoreOptions{
 		WezDBPath: "/nonexistent/wezterm.db",
 		Out:       &buf,
+		Replay:    []string{"claude"}, // avoid loading the real user config
 	})
 	if err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
 	if res.WindowsSpawned != 0 {
 		t.Errorf("should have spawned nothing, got %d", res.WindowsSpawned)
+	}
+}
+
+func TestRestoreSpawnIfEmptyOnMissingDB(t *testing.T) {
+	f := newFakeSpawner()
+	var buf bytes.Buffer
+	res, err := Restore(context.Background(), RestoreOptions{
+		WezDBPath:    "/nonexistent/wezterm.db",
+		SpawnIfEmpty: true,
+		Spawner:      f,
+		Out:          &buf,
+		Replay:       []string{"claude"},
+	})
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	if res.WindowsSpawned != 1 {
+		t.Errorf("SpawnIfEmpty should open one fallback window, got %d", res.WindowsSpawned)
+	}
+	if len(f.calls) != 1 || f.calls[0].Kind != "new-window" {
+		t.Errorf("expected a single new-window fallback call, got %+v", f.calls)
+	}
+}
+
+func TestRestoreSpawnIfEmptyNoopWhenLayoutExists(t *testing.T) {
+	wezPath := seedSnapshot(t)
+	f := newFakeSpawner()
+	res, err := Restore(context.Background(), RestoreOptions{
+		WezDBPath:    wezPath,
+		SpawnIfEmpty: true,
+		Spawner:      f,
+		Replay:       []string{"claude", "tomoe"},
+	})
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	// Two real windows restored; the fallback must NOT add a third.
+	if res.WindowsSpawned != 2 {
+		t.Errorf("windows = %d, want 2 (no spurious fallback window)", res.WindowsSpawned)
 	}
 }
 

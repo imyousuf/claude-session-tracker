@@ -8,7 +8,7 @@ import (
 )
 
 func TestResolveClaudeWithLinkedSession(t *testing.T) {
-	r := NewResolver([]string{"claude", "tomoe"})
+	r := NewResolver([]string{"claude", "tomoe"}, nil)
 	plan := r.Resolve(store.WezPane{
 		CWD:             "/proj",
 		CurrentCmd:      "claude",
@@ -23,8 +23,34 @@ func TestResolveClaudeWithLinkedSession(t *testing.T) {
 	}
 }
 
+func TestResolveClaudeWithLinkedSessionAppendsClaudeArgs(t *testing.T) {
+	r := NewResolver([]string{"claude"}, []string{"--dangerously-skip-permissions", "--foo"})
+	plan := r.Resolve(store.WezPane{
+		CWD:             "/proj",
+		CurrentCmd:      "claude",
+		ClaudeSessionID: "sess-abc",
+	})
+	want := []string{"claude", "--resume", "sess-abc", "--dangerously-skip-permissions", "--foo"}
+	if !reflect.DeepEqual(plan.Command, want) {
+		t.Errorf("command = %v, want %v", plan.Command, want)
+	}
+}
+
+func TestResolveClaudeArgsOnlyApplyToResume(t *testing.T) {
+	// The literal-replay fallback (no linked session) must NOT get claude args.
+	r := NewResolver([]string{"claude"}, []string{"--dangerously-skip-permissions"})
+	plan := r.Resolve(store.WezPane{
+		CWD:        "/proj",
+		CurrentCmd: "claude --some-flag",
+	})
+	want := []string{"sh", "-c", "exec claude --some-flag"}
+	if !reflect.DeepEqual(plan.Command, want) {
+		t.Errorf("command = %v, want %v", plan.Command, want)
+	}
+}
+
 func TestResolveClaudeNoSessionFallsBackToLiteral(t *testing.T) {
-	r := NewResolver([]string{"claude"})
+	r := NewResolver([]string{"claude"}, nil)
 	plan := r.Resolve(store.WezPane{
 		CWD:        "/proj",
 		CurrentCmd: "claude --some-flag",
@@ -36,7 +62,7 @@ func TestResolveClaudeNoSessionFallsBackToLiteral(t *testing.T) {
 }
 
 func TestResolveTomoeLiteralReplay(t *testing.T) {
-	r := NewResolver([]string{"claude", "tomoe"})
+	r := NewResolver([]string{"claude", "tomoe"}, nil)
 	plan := r.Resolve(store.WezPane{
 		CWD:        "/audio",
 		CurrentCmd: "tomoe start --device hw:0,0",
@@ -48,7 +74,7 @@ func TestResolveTomoeLiteralReplay(t *testing.T) {
 }
 
 func TestResolveUsesLastCmdWhenCurrentEmpty(t *testing.T) {
-	r := NewResolver([]string{"claude"})
+	r := NewResolver([]string{"claude"}, nil)
 	plan := r.Resolve(store.WezPane{
 		CWD:     "/proj",
 		LastCmd: "claude --resume xyz",
@@ -60,7 +86,7 @@ func TestResolveUsesLastCmdWhenCurrentEmpty(t *testing.T) {
 }
 
 func TestResolveUnknownCommandGetsPlainShell(t *testing.T) {
-	r := NewResolver([]string{"claude", "tomoe"})
+	r := NewResolver([]string{"claude", "tomoe"}, nil)
 	plan := r.Resolve(store.WezPane{
 		CWD:     "/proj",
 		LastCmd: "vim foo.go",
@@ -74,7 +100,7 @@ func TestResolveUnknownCommandGetsPlainShell(t *testing.T) {
 }
 
 func TestResolveNoCommandCaptured(t *testing.T) {
-	r := NewResolver([]string{"claude"})
+	r := NewResolver([]string{"claude"}, nil)
 	plan := r.Resolve(store.WezPane{CWD: "/proj"})
 	if len(plan.Command) != 0 {
 		t.Errorf("no capture should get plain shell")
@@ -82,7 +108,7 @@ func TestResolveNoCommandCaptured(t *testing.T) {
 }
 
 func TestResolveStripsEnvPrefixes(t *testing.T) {
-	r := NewResolver([]string{"tomoe"})
+	r := NewResolver([]string{"tomoe"}, nil)
 	plan := r.Resolve(store.WezPane{
 		CWD:        "/audio",
 		CurrentCmd: "FOO=1 BAR=baz tomoe start",

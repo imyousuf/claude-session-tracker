@@ -691,10 +691,11 @@ func init() {
 // --- Restore Command ---
 
 var (
-	flagRestoreDryRun    bool
-	flagRestoreSkipFirst bool
-	flagRestoreWorkspace string
-	flagRestoreWezDB     string
+	flagRestoreDryRun       bool
+	flagRestoreSkipFirst    bool
+	flagRestoreSpawnIfEmpty bool
+	flagRestoreWorkspace    string
+	flagRestoreWezDB        string
 )
 
 var restoreCmd = &cobra.Command{
@@ -702,24 +703,27 @@ var restoreCmd = &cobra.Command{
 	Short: "Reconstruct the wezterm layout from the latest snapshot",
 	Long: `Read the latest snapshot from ~/.cst/wezterm.db and reconstruct the layout
 via ` + "`wezterm cli spawn`" + `. Each window becomes a new wezterm window; each tab
-becomes a tab in that window; splits within a tab are flattened to tabs (v1
-limitation).
+becomes a tab in that window; additional panes within a tab are re-split into
+that tab via ` + "`wezterm cli split-pane`" + ` (split direction is approximate —
+wezterm does not expose the original geometry).
 
 Per-pane spawn command is decided by the replay-command registry:
-  - claude (with linked session): ` + "`claude --resume <id>`" + `
+  - claude (with linked session): ` + "`claude --resume <id>`" + ` plus any configured
+    claude args (e.g. --dangerously-skip-permissions)
   - other registry hit: replays the literal captured command
   - registry miss: opens a plain shell in the saved CWD
 
-Typically run from wezterm's gui-startup hook with --skip-first so we don't
-double-spawn alongside the default window wezterm already opened.`,
+Typically run from wezterm's gui-startup hook with --spawn-if-empty so a default
+window opens when there's no saved layout.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		_, err := snapshot.Restore(ctx, snapshot.RestoreOptions{
-			WezDBPath: flagRestoreWezDB,
-			Workspace: flagRestoreWorkspace,
-			SkipFirst: flagRestoreSkipFirst,
-			DryRun:    flagRestoreDryRun,
+			WezDBPath:    flagRestoreWezDB,
+			Workspace:    flagRestoreWorkspace,
+			SkipFirst:    flagRestoreSkipFirst,
+			SpawnIfEmpty: flagRestoreSpawnIfEmpty,
+			DryRun:       flagRestoreDryRun,
 		})
 		return err
 	},
@@ -729,7 +733,9 @@ func init() {
 	restoreCmd.Flags().BoolVar(&flagRestoreDryRun, "dry-run", false,
 		"Print the planned wezterm cli calls without executing")
 	restoreCmd.Flags().BoolVar(&flagRestoreSkipFirst, "skip-first", false,
-		"Skip the very first pane (for use from wezterm gui-startup, which already opens a window)")
+		"Skip the very first pane (legacy; gui-startup now uses --spawn-if-empty)")
+	restoreCmd.Flags().BoolVar(&flagRestoreSpawnIfEmpty, "spawn-if-empty", false,
+		"Open a default window if there's no snapshot to restore (for gui-startup)")
 	restoreCmd.Flags().StringVar(&flagRestoreWorkspace, "workspace", "",
 		"Only restore windows in this workspace")
 	restoreCmd.Flags().StringVar(&flagRestoreWezDB, "wez-db", "",
@@ -926,7 +932,7 @@ Use --print to print the unit file without writing anything.`,
 
 		if flagSetupDaemonPrint {
 			exe, _ := os.Executable()
-			fmt.Print(fmt.Sprintf(daemonsetup.UnitTemplate, exe))
+			fmt.Printf(daemonsetup.UnitTemplate, exe)
 			return nil
 		}
 

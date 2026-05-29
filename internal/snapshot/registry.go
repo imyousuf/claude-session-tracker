@@ -17,11 +17,20 @@ type ReplayPlan struct {
 // Resolver maps a stored pane to a spawn plan using the user's ReplayCommands.
 type Resolver struct {
 	registry map[string]struct{}
+	// claudeArgs are appended to `claude --resume <id>` (e.g.
+	// --dangerously-skip-permissions and any extra_args from config). They are
+	// NOT applied to the literal-replay fallback, which already carries whatever
+	// flags the user originally typed.
+	claudeArgs []string
 }
 
-// NewResolver builds a Resolver from a list of replay-able command names.
-func NewResolver(replayCommands []string) *Resolver {
-	r := &Resolver{registry: make(map[string]struct{}, len(replayCommands))}
+// NewResolver builds a Resolver from a list of replay-able command names and the
+// extra args to append when resuming a linked claude session.
+func NewResolver(replayCommands []string, claudeArgs []string) *Resolver {
+	r := &Resolver{
+		registry:   make(map[string]struct{}, len(replayCommands)),
+		claudeArgs: claudeArgs,
+	}
 	for _, n := range replayCommands {
 		r.registry[strings.TrimSpace(n)] = struct{}{}
 	}
@@ -37,7 +46,7 @@ func NewResolver(replayCommands []string) *Resolver {
 //     skipping leading VAR=value env prefixes (e.g. `FOO=bar tomoe` → `tomoe`).
 //  3. If that name is in ReplayCommands, replay:
 //     - `claude` special case: when claude_session_id is set on the pane,
-//       spawn `claude --resume <id>` regardless of the captured literal.
+//     spawn `claude --resume <id>` regardless of the captured literal.
 //     - default: spawn `sh -c "exec <captured>"` so any user quoting works.
 //  4. Otherwise: open a plain shell in the saved CWD.
 func (r *Resolver) Resolve(pane store.WezPane) ReplayPlan {
@@ -59,10 +68,16 @@ func (r *Resolver) Resolve(pane store.WezPane) ReplayPlan {
 	}
 	plan.Matched = name
 
-	// Claude special case.
+	// Claude special case: resume the linked session, appending the configured
+	// claude args (e.g. --dangerously-skip-permissions for YOLO mode).
 	if name == "claude" && pane.ClaudeSessionID != "" {
-		plan.Command = []string{"claude", "--resume", pane.ClaudeSessionID}
+		cmd := []string{"claude", "--resume", pane.ClaudeSessionID}
+		cmd = append(cmd, r.claudeArgs...)
+		plan.Command = cmd
 		plan.Reason = "claude session " + pane.ClaudeSessionID + " linked; spawning with --resume"
+		if len(r.claudeArgs) > 0 {
+			plan.Reason += " " + strings.Join(r.claudeArgs, " ")
+		}
 		return plan
 	}
 
@@ -93,7 +108,7 @@ func isLikelyEnvKey(s string) bool {
 		isUpper := c >= 'A' && c <= 'Z'
 		isDigit := c >= '0' && c <= '9'
 		isUnderscore := c == '_'
-		if !(isUpper || isDigit || isUnderscore) {
+		if !isUpper && !isDigit && !isUnderscore {
 			return false
 		}
 	}

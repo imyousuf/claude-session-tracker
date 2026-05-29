@@ -23,6 +23,11 @@ type Spawner interface {
 	// SpawnTabInWindow opens a new tab in the given window. Returns pane ID.
 	SpawnTabInWindow(windowID int64, cwd string, cmd []string) (paneID int64, err error)
 
+	// SplitPane splits the given pane and runs cmd in the new pane (or default
+	// shell if cmd is empty). Returns the new pane ID. Used to reconstruct the
+	// extra panes of a multi-pane tab.
+	SplitPane(paneID int64, cwd string, cmd []string) (newPaneID int64, err error)
+
 	// LookupWindowForPane queries wezterm for the window ID that owns the
 	// given pane. Used to thread a fresh window's ID into subsequent
 	// SpawnTabInWindow calls.
@@ -38,6 +43,19 @@ func (WeztermSpawner) SpawnNewWindow(cwd string, cmd []string) (int64, error) {
 
 func (WeztermSpawner) SpawnTabInWindow(windowID int64, cwd string, cmd []string) (int64, error) {
 	return wezterm.Spawn(wezterm.SpawnArgs{WindowID: windowID, CWD: cwd, Command: cmd})
+}
+
+func (WeztermSpawner) SplitPane(paneID int64, cwd string, cmd []string) (int64, error) {
+	// Direction isn't recoverable from `wezterm cli list` (it exposes no split
+	// geometry), so we always split to the right. This keeps the panes in the
+	// same tab — the important property — even if the exact orientation differs
+	// from the original layout.
+	return wezterm.SplitPane(wezterm.SplitArgs{
+		PaneID:    paneID,
+		Direction: wezterm.SplitRight,
+		CWD:       cwd,
+		Command:   cmd,
+	})
 }
 
 func (WeztermSpawner) LookupWindowForPane(paneID int64) (int64, error) {
@@ -59,9 +77,16 @@ type RestoreOptions struct {
 	Workspace string // "" = restore all workspaces
 
 	// SkipFirst skips the very first pane of the very first window in the
-	// restore plan. Used by wezterm's gui-startup hook so we don't double-
-	// spawn alongside the default window wezterm already opened.
+	// restore plan. Legacy: was used by gui-startup when it pre-spawned a
+	// default window. The current gui-startup uses SpawnIfEmpty instead so the
+	// first pane (which may be running claude) is never dropped.
 	SkipFirst bool
+
+	// SpawnIfEmpty opens a single default window when the restore would
+	// otherwise spawn nothing (no snapshot, empty snapshot, missing DB, or
+	// workspace filter matched nothing). Used by gui-startup so wezterm always
+	// has a window to show even on a first run with no saved layout.
+	SpawnIfEmpty bool
 
 	// DryRun prints the planned wezterm cli calls to Out instead of executing.
 	DryRun bool
@@ -71,12 +96,20 @@ type RestoreOptions struct {
 
 	// Replay overrides the ReplayCommands list (otherwise read from config).
 	Replay []string
+
+	// ClaudeArgs are appended to `claude --resume <id>` when restoring a pane
+	// with a linked claude session (e.g. --dangerously-skip-permissions for YOLO
+	// mode plus any configured extra_args). Loaded from config alongside Replay
+	// when Replay is nil; callers that set Replay explicitly (tests) own this
+	// too.
+	ClaudeArgs []string
 }
 
 // RestoreResult summarizes what Restore did.
 type RestoreResult struct {
 	WindowsSpawned int
 	TabsSpawned    int
+	PanesSplit     int
 	PanesSkipped   int
 	Errors         []error
 }
@@ -108,12 +141,14 @@ func Restore(ctx context.Context, opts RestoreOptions) (RestoreResult, error) {
 		cfg, _ := config.Load(config.DefaultConfigPath())
 		cfg = cfg.WithDefaults()
 		opts.Replay = cfg.ReplayCommands
+		opts.ClaudeArgs = cfg.ClaudeArgs()
 	}
 
 	w, err := store.OpenWezReadOnly(opts.WezDBPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			fmt.Fprintln(opts.Out, "no snapshot to restore (wezterm.db not found)")
+			_, _ = fmt.Fprintln(opts.Out, "no snapshot to restore (wezterm.db not found)")
+			spawnFallbackIfEmpty(&res, opts)
 			return res, nil
 		}
 		return res, fmt.Errorf("open wezterm.db: %w", err)
@@ -125,90 +160,165 @@ func Restore(ctx context.Context, opts RestoreOptions) (RestoreResult, error) {
 		return res, fmt.Errorf("read tree: %w", err)
 	}
 	if len(tree.Windows) == 0 {
-		fmt.Fprintln(opts.Out, "no windows in snapshot; nothing to restore")
+		_, _ = fmt.Fprintln(opts.Out, "no windows in snapshot; nothing to restore")
+		spawnFallbackIfEmpty(&res, opts)
 		return res, nil
 	}
 
-	resolver := NewResolver(opts.Replay)
+	resolver := NewResolver(opts.Replay, opts.ClaudeArgs)
 	skippedFirst := false
 
+	// Each snapshot window becomes a new wezterm window; each tab within it
+	// becomes a tab; additional panes within a tab are re-split into that tab.
 	for _, win := range tree.Windows {
 		if opts.Workspace != "" && win.Workspace != opts.Workspace {
 			continue
 		}
-
-		// Collect all panes for this window in (tab, pane) order.
-		var winPanes []store.WezPane
-		for _, tab := range win.Tabs {
-			winPanes = append(winPanes, tab.Panes...)
-		}
-		if len(winPanes) == 0 {
+		if len(win.Tabs) == 0 {
 			continue
 		}
 
-		var liveWindowID int64
-		for i, pane := range winPanes {
-			if ctx.Err() != nil {
-				return res, ctx.Err()
-			}
+		var liveWindowID int64 // wezterm window the new tabs/splits go into
+		windowOpened := false  // have we spawned this window's first pane yet?
 
-			plan := resolver.Resolve(pane)
-
-			// SkipFirst applies to the very first pane of the very first
-			// window we process.
-			if i == 0 && opts.SkipFirst && !skippedFirst {
-				skippedFirst = true
-				res.PanesSkipped++
+		for _, tab := range win.Tabs {
+			if len(tab.Panes) == 0 {
 				continue
 			}
 
-			if i == 0 {
-				// New window.
-				if opts.DryRun {
-					fmt.Fprintf(opts.Out, "wezterm cli spawn --new-window --cwd %s %s\n",
-						plan.CWD, formatCmd(plan.Command))
-					fmt.Fprintf(opts.Out, "  reason: %s\n", plan.Reason)
+			// firstPaneID is the lead pane of this tab — the one subsequent
+			// panes in the same tab split off of.
+			var firstPaneID int64
+			tabLeadDone := false
+
+			for paneIdx, pane := range tab.Panes {
+				if ctx.Err() != nil {
+					return res, ctx.Err()
+				}
+
+				plan := resolver.Resolve(pane)
+
+				// SkipFirst skips the very first pane of the very first window:
+				// wezterm's gui-startup already opened one window+pane for us.
+				if !windowOpened && paneIdx == 0 && opts.SkipFirst && !skippedFirst {
+					skippedFirst = true
+					windowOpened = true
+					res.PanesSkipped++
+					// This skipped pane is the tab's lead pane, but we have no
+					// pane ID to split off of, so extra panes in this tab fall
+					// back to new tabs below.
+					continue
+				}
+
+				switch {
+				case !windowOpened:
+					// First pane of the window → open a new window.
+					if opts.DryRun {
+						_, _ = fmt.Fprintf(opts.Out, "wezterm cli spawn --new-window --cwd %s %s\n",
+							plan.CWD, formatCmd(plan.Command))
+						_, _ = fmt.Fprintf(opts.Out, "  reason: %s\n", plan.Reason)
+						res.WindowsSpawned++
+						windowOpened = true
+						firstPaneID = -1 // unknown in dry-run
+						tabLeadDone = true
+						continue
+					}
+					paneID, err := opts.Spawner.SpawnNewWindow(plan.CWD, plan.Command)
+					if err != nil {
+						res.Errors = append(res.Errors, fmt.Errorf("spawn new window for %s: %w", plan.CWD, err))
+						continue
+					}
+					wid, err := opts.Spawner.LookupWindowForPane(paneID)
+					if err != nil {
+						res.Errors = append(res.Errors, fmt.Errorf("lookup window for pane %d: %w", paneID, err))
+						continue
+					}
+					liveWindowID = wid
+					windowOpened = true
+					firstPaneID = paneID
+					tabLeadDone = true
 					res.WindowsSpawned++
-					continue
-				}
-				paneID, err := opts.Spawner.SpawnNewWindow(plan.CWD, plan.Command)
-				if err != nil {
-					res.Errors = append(res.Errors, fmt.Errorf("spawn new window for %s: %w", plan.CWD, err))
-					continue
-				}
-				wid, err := opts.Spawner.LookupWindowForPane(paneID)
-				if err != nil {
-					res.Errors = append(res.Errors, fmt.Errorf("lookup window for pane %d: %w", paneID, err))
-					continue
-				}
-				liveWindowID = wid
-				res.WindowsSpawned++
-				continue
-			}
 
-			// Subsequent panes in this window → new tab.
-			if opts.DryRun {
-				fmt.Fprintf(opts.Out, "wezterm cli spawn --window-id <new> --cwd %s %s\n",
-					plan.CWD, formatCmd(plan.Command))
-				fmt.Fprintf(opts.Out, "  reason: %s\n", plan.Reason)
-				res.TabsSpawned++
-				continue
+				case !tabLeadDone:
+					// First pane of a subsequent tab → new tab in this window.
+					if opts.DryRun {
+						_, _ = fmt.Fprintf(opts.Out, "wezterm cli spawn --window-id <new> --cwd %s %s\n",
+							plan.CWD, formatCmd(plan.Command))
+						_, _ = fmt.Fprintf(opts.Out, "  reason: %s\n", plan.Reason)
+						res.TabsSpawned++
+						firstPaneID = -1
+						tabLeadDone = true
+						continue
+					}
+					paneID, err := opts.Spawner.SpawnTabInWindow(liveWindowID, plan.CWD, plan.Command)
+					if err != nil {
+						res.Errors = append(res.Errors, fmt.Errorf("spawn tab in window %d: %w", liveWindowID, err))
+						continue
+					}
+					firstPaneID = paneID
+					tabLeadDone = true
+					res.TabsSpawned++
+
+				default:
+					// Additional pane in the same tab → split off the tab lead.
+					if opts.DryRun {
+						_, _ = fmt.Fprintf(opts.Out, "wezterm cli split-pane --pane-id <tab-lead> --cwd %s %s\n",
+							plan.CWD, formatCmd(plan.Command))
+						_, _ = fmt.Fprintf(opts.Out, "  reason: %s\n", plan.Reason)
+						res.PanesSplit++
+						continue
+					}
+					if firstPaneID <= 0 {
+						// No lead pane to split off (e.g. the tab lead was the
+						// skipped first pane). Fall back to a new tab so the pane
+						// isn't lost.
+						if _, err := opts.Spawner.SpawnTabInWindow(liveWindowID, plan.CWD, plan.Command); err != nil {
+							res.Errors = append(res.Errors, fmt.Errorf("spawn fallback tab in window %d: %w", liveWindowID, err))
+							continue
+						}
+						res.TabsSpawned++
+						continue
+					}
+					if _, err := opts.Spawner.SplitPane(firstPaneID, plan.CWD, plan.Command); err != nil {
+						res.Errors = append(res.Errors, fmt.Errorf("split pane %d: %w", firstPaneID, err))
+						continue
+					}
+					res.PanesSplit++
+				}
 			}
-			if _, err := opts.Spawner.SpawnTabInWindow(liveWindowID, plan.CWD, plan.Command); err != nil {
-				res.Errors = append(res.Errors, fmt.Errorf("spawn tab in window %d: %w", liveWindowID, err))
-				continue
-			}
-			res.TabsSpawned++
 		}
 	}
 
+	// If the layout produced no windows (e.g. every window was filtered out or
+	// errored) and the caller asked for a fallback, open a default window.
+	spawnFallbackIfEmpty(&res, opts)
+
 	if len(res.Errors) > 0 {
-		fmt.Fprintf(opts.Out, "\nrestore completed with %d error(s):\n", len(res.Errors))
+		_, _ = fmt.Fprintf(opts.Out, "\nrestore completed with %d error(s):\n", len(res.Errors))
 		for _, e := range res.Errors {
-			fmt.Fprintf(opts.Out, "  - %v\n", e)
+			_, _ = fmt.Fprintf(opts.Out, "  - %v\n", e)
 		}
 	}
 	return res, nil
+}
+
+// spawnFallbackIfEmpty opens a single default window when SpawnIfEmpty is set
+// and nothing has been spawned yet. Keeps wezterm from starting with no window
+// on a first run (no snapshot). No-op in dry-run.
+func spawnFallbackIfEmpty(res *RestoreResult, opts RestoreOptions) {
+	if !opts.SpawnIfEmpty || res.WindowsSpawned > 0 {
+		return
+	}
+	if opts.DryRun {
+		_, _ = fmt.Fprintln(opts.Out, "wezterm cli spawn --new-window  (fallback: empty snapshot)")
+		res.WindowsSpawned++
+		return
+	}
+	if _, err := opts.Spawner.SpawnNewWindow("", nil); err != nil {
+		res.Errors = append(res.Errors, fmt.Errorf("spawn fallback window: %w", err))
+		return
+	}
+	res.WindowsSpawned++
 }
 
 func formatCmd(cmd []string) string {

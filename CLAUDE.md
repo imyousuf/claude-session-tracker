@@ -68,8 +68,19 @@ written (so removing `tomoe` writes a list without it; the user can re-add).
 Restore resolution (`internal/snapshot/registry.go::Resolver.Resolve`):
 1. `current_cmd` if set, else `last_cmd`, else plain shell.
 2. First non-env-prefix token → if in registry, replay; if not, plain shell.
-3. Special case: `claude` with linked `claude_session_id` → `claude --resume <id>`.
+3. Special case: `claude` with linked `claude_session_id` → `claude --resume <id>`
+   plus `config.ClaudeArgs()` (`--dangerously-skip-permissions` when YOLO is on,
+   plus any `extra_args`). These args apply ONLY to `--resume`, not to the
+   literal-replay fallback.
 4. Otherwise replay literal as `sh -c "exec <captured>"` (quote-safe).
+
+Layout reconstruction (`internal/snapshot/restore.go::Restore`): each snapshot
+window → new wezterm window; each tab → a tab; additional panes within a tab →
+re-split into that tab via `wezterm cli split-pane` (direction is approximate —
+`wezterm cli list` exposes no split geometry). gui-startup calls
+`cst restore --spawn-if-empty` (NOT `--skip-first`): it does not pre-spawn a
+window, so the first saved pane — possibly a claude session — is never dropped;
+`--spawn-if-empty` opens one default window only when there's no snapshot.
 
 ### bash-preexec dependency
 

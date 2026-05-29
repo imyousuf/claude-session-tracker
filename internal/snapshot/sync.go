@@ -21,7 +21,7 @@ import (
 
 // SyncResult reports what a Sync call did.
 type SyncResult struct {
-	DidWork         bool  // false if hash-skipped
+	DidWork         bool // false if hash-skipped
 	WindowsWritten  int
 	TabsWritten     int
 	PanesWritten    int
@@ -156,7 +156,7 @@ func Sync(w *store.WezStore, raw []byte, panes []wezterm.RawPane, muxSocket stri
 func buildTree(panes []wezterm.RawPane) store.WezTree {
 	type tabKey struct{ winID, tabID int64 }
 
-	winSeen := map[int64]int{} // window_id -> index in tree.Windows
+	winSeen := map[int64]int{}  // window_id -> index in tree.Windows
 	tabSeen := map[tabKey]int{} // tab_key -> index in window.Tabs
 
 	var tree store.WezTree

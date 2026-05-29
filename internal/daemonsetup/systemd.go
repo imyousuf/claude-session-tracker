@@ -51,10 +51,10 @@ type Options struct {
 
 // Result describes what Install did.
 type Result struct {
-	UnitPath      string
-	Wrote         bool // true if the unit file content changed
-	DaemonReload  bool // true if we ran systemctl --user daemon-reload
-	Enabled       bool // true if we ran enable --now
+	UnitPath     string
+	Wrote        bool // true if the unit file content changed
+	DaemonReload bool // true if we ran systemctl --user daemon-reload
+	Enabled      bool // true if we ran enable --now
 }
 
 func defaultedOptions(o Options) (Options, error) {
