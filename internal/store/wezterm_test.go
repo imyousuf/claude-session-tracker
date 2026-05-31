@@ -436,7 +436,15 @@ func TestOpenWezReadOnly(t *testing.T) {
 // it must see data that is still only in the WAL (writer kept open, no
 // checkpoint).
 func TestOpenWezReadOnlySeesUncheckpointedWAL(t *testing.T) {
-	w, path := helperOpenWez(t) // stays open via t.Cleanup → WAL not checkpointed
+	// Open a writer and keep it open (no checkpoint) so the inserted rows live
+	// only in the -wal file when we read them back read-only.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "wezterm.db")
+	w, err := OpenWez(path)
+	if err != nil {
+		t.Fatalf("OpenWez: %v", err)
+	}
+	t.Cleanup(func() { _ = w.Close() })
 
 	if _, err := w.DB().Exec(
 		`INSERT INTO terminal_windows (window_id, workspace, win_index) VALUES (1, 'default', 0)`,
