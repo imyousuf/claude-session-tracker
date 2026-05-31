@@ -428,3 +428,59 @@ func TestOpenWezReadOnly(t *testing.T) {
 		t.Fatal("expected read-only write to fail")
 	}
 }
+
+// TestOpenWezReadOnlySeesUncheckpointedWAL is a regression test for the WAL
+// visibility bug: a mode=ro connection cannot read un-checkpointed WAL frames,
+// so `cst restore` saw an empty tree even though the daemon had just written a
+// snapshot. OpenWezReadOnly now opens read-write (for -shm) with query_only, so
+// it must see data that is still only in the WAL (writer kept open, no
+// checkpoint).
+func TestOpenWezReadOnlySeesUncheckpointedWAL(t *testing.T) {
+	w, path := helperOpenWez(t) // stays open via t.Cleanup → WAL not checkpointed
+
+	if _, err := w.DB().Exec(
+		`INSERT INTO terminal_windows (window_id, workspace, win_index) VALUES (1, 'default', 0)`,
+	); err != nil {
+		t.Fatalf("insert window: %v", err)
+	}
+	if _, err := w.DB().Exec(
+		`INSERT INTO terminal_tabs (tab_id, window_id, tab_index) VALUES (10, 1, 0)`,
+	); err != nil {
+		t.Fatalf("insert tab: %v", err)
+	}
+	if _, err := w.DB().Exec(
+		`INSERT INTO terminal_panes
+			(pane_id, tab_id, parent_pane_id, split_direction, size_cols, size_rows,
+			 cwd, title, foreground_pid, foreground_name, last_cmd, current_cmd, claude_session_id)
+		 VALUES (100, 10, NULL, NULL, 80, 24, '/proj', 'pane', NULL, NULL, NULL, 'claude', 'sess-1')`,
+	); err != nil {
+		t.Fatalf("insert pane: %v", err)
+	}
+
+	// Read via the read-only path WITHOUT closing the writer (data is WAL-only).
+	ro, err := OpenWezReadOnly(path)
+	if err != nil {
+		t.Fatalf("OpenWezReadOnly: %v", err)
+	}
+	defer func() { _ = ro.Close() }()
+
+	tree, err := ro.ReadTree()
+	if err != nil {
+		t.Fatalf("ReadTree: %v", err)
+	}
+	if len(tree.Windows) != 1 {
+		t.Fatalf("read-only open saw %d windows, want 1 (WAL data invisible?)", len(tree.Windows))
+	}
+	if got := len(tree.Windows[0].Tabs); got != 1 {
+		t.Fatalf("tabs = %d, want 1", got)
+	}
+	panes := tree.Windows[0].Tabs[0].Panes
+	if len(panes) != 1 || panes[0].ClaudeSessionID != "sess-1" {
+		t.Fatalf("panes = %+v, want 1 pane with claude session sess-1", panes)
+	}
+
+	// Verify it really is read-only: writes must be rejected.
+	if _, err := ro.DB().Exec(`INSERT INTO terminal_windows (window_id, workspace, win_index) VALUES (2, 'x', 1)`); err == nil {
+		t.Error("expected write to be rejected on read-only handle")
+	}
+}

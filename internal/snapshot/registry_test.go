@@ -36,6 +36,54 @@ func TestResolveClaudeWithLinkedSessionAppendsClaudeArgs(t *testing.T) {
 	}
 }
 
+func TestResolveCstLauncherWithLinkedSessionResumes(t *testing.T) {
+	// A pane running Claude via the `cst` wrapper records current_cmd="cst".
+	// `cst` is NOT in the replay registry, but a linked claude_session_id must
+	// still resume the Claude session (the binding is stronger than the captured
+	// command name).
+	r := NewResolver([]string{"claude", "tomoe"}, []string{"--dangerously-skip-permissions"})
+	plan := r.Resolve(store.WezPane{
+		CWD:             "/proj",
+		CurrentCmd:      "cst",
+		LastCmd:         "wezterm cli split-pane --right",
+		ClaudeSessionID: "sess-cst",
+	})
+	want := []string{"claude", "--resume", "sess-cst", "--dangerously-skip-permissions"}
+	if !reflect.DeepEqual(plan.Command, want) {
+		t.Errorf("command = %v, want %v", plan.Command, want)
+	}
+	if plan.Matched != "cst" {
+		t.Errorf("Matched = %q, want cst", plan.Matched)
+	}
+}
+
+func TestResolveCstLauncherWithoutSessionGetsPlainShell(t *testing.T) {
+	// `cst` with no linked session is not a replayable command — plain shell.
+	r := NewResolver([]string{"claude", "tomoe"}, nil)
+	plan := r.Resolve(store.WezPane{
+		CWD:        "/proj",
+		CurrentCmd: "cst",
+	})
+	if len(plan.Command) != 0 {
+		t.Errorf("cst without session should get plain shell, got %v", plan.Command)
+	}
+}
+
+func TestResolveCstResumeBeatsRegistryGate(t *testing.T) {
+	// Even with an empty registry, a cst-launched pane with a linked session
+	// resumes Claude — the special case is checked before the registry gate.
+	r := NewResolver(nil, nil)
+	plan := r.Resolve(store.WezPane{
+		CWD:             "/proj",
+		CurrentCmd:      "cst",
+		ClaudeSessionID: "sess-xyz",
+	})
+	want := []string{"claude", "--resume", "sess-xyz"}
+	if !reflect.DeepEqual(plan.Command, want) {
+		t.Errorf("command = %v, want %v", plan.Command, want)
+	}
+}
+
 func TestResolveClaudeArgsOnlyApplyToResume(t *testing.T) {
 	// The literal-replay fallback (no linked session) must NOT get claude args.
 	r := NewResolver([]string{"claude"}, []string{"--dangerously-skip-permissions"})

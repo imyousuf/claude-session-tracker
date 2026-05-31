@@ -116,11 +116,25 @@ func OpenWez(dbPath string) (*WezStore, error) {
 }
 
 // OpenWezReadOnly opens wezterm.db for read-only access (used by `cst restore`).
+//
+// IMPORTANT: we deliberately do NOT use mode=ro. The database is in WAL mode and
+// the daemon's most recent snapshot usually lives in the -wal file, not yet
+// checkpointed into the main db file. A mode=ro connection cannot read
+// un-checkpointed WAL frames — reading the WAL requires creating/writing the
+// -shm shared-memory index, which read-only access forbids — so it silently
+// falls back to the stale main-file checkpoint (often zero rows). Restore would
+// then see an empty tree and spawn nothing.
+//
+// Instead we open with normal (read-write-capable) file access so SQLite can
+// build the -shm index and read the live WAL, and set query_only(true) to forbid
+// any writes. This gives true read-only semantics while still seeing the
+// daemon's latest committed snapshot. WAL allows our reader to coexist with the
+// daemon's single writer.
 func OpenWezReadOnly(dbPath string) (*WezStore, error) {
 	if _, err := os.Stat(dbPath); err != nil {
 		return nil, fmt.Errorf("wezterm.db not found at %s: %w", dbPath, err)
 	}
-	dsn := fmt.Sprintf("file:%s?mode=ro&_pragma=busy_timeout(5000)", dbPath)
+	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=query_only(true)", dbPath)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open wezterm.db read-only: %w", err)
