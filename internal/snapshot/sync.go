@@ -22,6 +22,7 @@ import (
 // SyncResult reports what a Sync call did.
 type SyncResult struct {
 	DidWork         bool // false if hash-skipped
+	SkippedClobber  bool // true if the incoming snapshot was refused (clobber guard)
 	WindowsWritten  int
 	TabsWritten     int
 	PanesWritten    int
@@ -60,6 +61,29 @@ func Sync(w *store.WezStore, raw []byte, panes []wezterm.RawPane, muxSocket stri
 	}
 
 	tree := buildTree(panes)
+
+	// Clobber guard: refuse to overwrite a meaningful saved snapshot with an
+	// empty fresh-start one. When wezterm is restarted, the new (empty) instance
+	// fires a snapshot before `cst restore` can run; without this guard that
+	// empty layout would DELETE the saved windows/tabs/panes — destroying the
+	// very thing restore is supposed to read. The incoming tree carries no
+	// command/claude state for its panes (the daemon hasn't seen any preexec yet
+	// on a fresh start), so we detect "smaller AND command-less" and skip.
+	if hasPrev {
+		saved, err := w.GetSnapshotStats()
+		if err != nil {
+			return res, fmt.Errorf("get snapshot stats: %w", err)
+		}
+		if shouldSkipClobber(saved, incomingStats(w, tree, muxSocket)) {
+			res.SkippedClobber = true
+			// Keep the saved snapshot; just refresh the timestamp so the daemon's
+			// debounce/age tracking still advances.
+			if err := w.TouchSnapshotTimestamp(res.SnapshotTakenAt); err != nil {
+				return res, fmt.Errorf("touch snapshot meta: %w", err)
+			}
+			return res, nil
+		}
+	}
 
 	db := w.DB()
 	tx, err := db.Begin()
@@ -148,6 +172,60 @@ func Sync(w *store.WezStore, raw []byte, panes []wezterm.RawPane, muxSocket stri
 	committed = true
 	res.DidWork = true
 	return res, nil
+}
+
+// incomingStats summarizes a freshly-built tree for the clobber guard. Crucially
+// it joins each incoming pane against pane_runtime_state (under muxSocket) so we
+// can tell whether the incoming snapshot has any live command/claude state. A
+// freshly-restarted, empty wezterm has none (no preexec seen yet); a live
+// session that just lost a pane still has runtime state on its survivors.
+func incomingStats(w *store.WezStore, tree store.WezTree, muxSocket string) store.SnapshotStats {
+	var s store.SnapshotStats
+	for _, win := range tree.Windows {
+		for _, tab := range win.Tabs {
+			for _, pane := range tab.Panes {
+				s.PaneCount++
+				if muxSocket == "" {
+					continue
+				}
+				rs, ok, err := w.LookupPaneRuntime(muxSocket, pane.PaneID)
+				if err != nil || !ok {
+					continue
+				}
+				if rs.CurrentCommand != "" || rs.LastCommand != "" || rs.ClaudeSessionID != "" {
+					s.CommandedPanes++
+				}
+				if rs.ClaudeSessionID != "" {
+					s.ClaudePanes++
+				}
+			}
+		}
+	}
+	return s
+}
+
+// shouldSkipClobber decides whether to refuse an incoming snapshot so it can't
+// destroy a meaningful saved layout. This is the fix for the startup race where
+// a freshly-restarted (empty) wezterm snapshots before `cst restore` runs and
+// would otherwise DELETE the saved windows/tabs/panes.
+//
+// Refuse only the unambiguous clobber:
+//   - the saved snapshot carries real state (commands or claude sessions), and
+//   - the incoming snapshot carries NO command/claude state at all (the
+//     empty-fresh-start signature), and
+//   - the incoming snapshot is strictly smaller than what's saved.
+//
+// A genuine user-driven shrink (closing a pane mid-session) is preserved because
+// its surviving panes still have runtime state, so incoming.CommandedPanes > 0
+// and we allow the write.
+func shouldSkipClobber(saved, incoming store.SnapshotStats) bool {
+	if saved.CommandedPanes == 0 && saved.ClaudePanes == 0 {
+		return false // nothing meaningful saved → always allow
+	}
+	if incoming.CommandedPanes > 0 || incoming.ClaudePanes > 0 {
+		return false // incoming has real content → legitimate live update
+	}
+	return incoming.PaneCount < saved.PaneCount
 }
 
 // buildTree groups flat panes from `wezterm cli list` into windows → tabs → panes.

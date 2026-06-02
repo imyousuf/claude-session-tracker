@@ -205,6 +205,34 @@ func (w *WezStore) GetSnapshotMeta() (SnapshotMeta, bool, error) {
 	return m, true, nil
 }
 
+// SnapshotStats summarizes the currently-stored snapshot tree. Used by Sync's
+// clobber guard to decide whether an incoming (possibly empty) snapshot should
+// be allowed to replace what's saved.
+type SnapshotStats struct {
+	PaneCount      int // total terminal_panes rows
+	CommandedPanes int // panes with current_cmd, last_cmd, or claude_session_id set
+	ClaudePanes    int // panes with a non-NULL claude_session_id
+}
+
+// GetSnapshotStats returns counts describing the stored snapshot. A zero-value
+// SnapshotStats (all zero) means there is no meaningful saved layout.
+func (w *WezStore) GetSnapshotStats() (SnapshotStats, error) {
+	var s SnapshotStats
+	err := w.db.QueryRow(`
+		SELECT
+			COUNT(*),
+			COALESCE(SUM(CASE WHEN current_cmd IS NOT NULL
+			                    OR last_cmd IS NOT NULL
+			                    OR claude_session_id IS NOT NULL THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN claude_session_id IS NOT NULL THEN 1 ELSE 0 END), 0)
+		FROM terminal_panes
+	`).Scan(&s.PaneCount, &s.CommandedPanes, &s.ClaudePanes)
+	if err != nil {
+		return SnapshotStats{}, err
+	}
+	return s, nil
+}
+
 // SetSnapshotMeta upserts the single snapshot_meta row.
 func (w *WezStore) SetSnapshotMeta(m SnapshotMeta) error {
 	_, err := w.db.Exec(`

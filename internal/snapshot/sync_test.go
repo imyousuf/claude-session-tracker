@@ -35,27 +35,27 @@ func sampleTree() (raw []byte, panes []wezterm.RawPane) {
 	panes = []wezterm.RawPane{
 		{
 			WindowID: 0, TabID: 1, PaneID: 1, Workspace: "default",
-			Size: wezterm.Size{Cols: 254, Rows: 59},
-			CWD:  "file://host/home/user/projects/foo/",
+			Size:    wezterm.Size{Cols: 254, Rows: 59},
+			CWD:     "file://host/home/user/projects/foo/",
 			TTYName: "/dev/pts/15", IsActive: true,
 		},
 		{
 			WindowID: 0, TabID: 6, PaneID: 12, Workspace: "default",
-			Size: wezterm.Size{Cols: 127, Rows: 59},
-			CWD:  "file://host/home/user/projects/bar/",
+			Size:  wezterm.Size{Cols: 127, Rows: 59},
+			CWD:   "file://host/home/user/projects/bar/",
 			Title: "claude", LeftCol: 0, IsActive: true,
 			TTYName: "/dev/pts/14",
 		},
 		{
 			WindowID: 0, TabID: 6, PaneID: 13, Workspace: "default",
-			Size: wezterm.Size{Cols: 126, Rows: 59},
-			CWD:  "file://host/home/user/projects/bar/",
+			Size:    wezterm.Size{Cols: 126, Rows: 59},
+			CWD:     "file://host/home/user/projects/bar/",
 			LeftCol: 128, TTYName: "/dev/pts/19",
 		},
 		{
 			WindowID: 1, TabID: 8, PaneID: 20, Workspace: "default",
-			Size: wezterm.Size{Cols: 200, Rows: 50},
-			CWD:  "file://host/home/user/audio/",
+			Size:  wezterm.Size{Cols: 200, Rows: 50},
+			CWD:   "file://host/home/user/audio/",
 			Title: "tomoe", IsActive: true,
 			TTYName: "/dev/pts/22",
 		},
@@ -362,5 +362,159 @@ func TestSyncEmptyPanesNoCrash(t *testing.T) {
 	}
 	if got := countRows(t, w, "terminal_panes"); got != 0 {
 		t.Errorf("pane rows = %d", got)
+	}
+}
+
+// --- Clobber guard: an empty restarted wezterm must not overwrite a saved layout ---
+
+// helperEmptyStartupPanes returns a single-pane "fresh wezterm" payload (the
+// shape an empty restarted instance produces) with a distinct mux socket.
+func helperEmptyStartupPanes() ([]byte, []wezterm.RawPane, string) {
+	panes := []wezterm.RawPane{
+		{
+			WindowID: 99, TabID: 99, PaneID: 99, Workspace: "default",
+			Size:    wezterm.Size{Cols: 200, Rows: 50},
+			CWD:     "file://host/home/user/",
+			TTYName: "/dev/pts/0", IsActive: true,
+		},
+	}
+	return []byte("empty-startup-1pane"), panes, "/run/wezterm/new-mux"
+}
+
+// TestSyncGuardRefusesEmptyStartupClobber is the regression test for the bug
+// that wiped a real 12-pane layout: a restarted, empty wezterm fired a snapshot
+// (1 pane, no command state) before `cst restore` ran, and Sync DELETEd the
+// saved tree. The guard must refuse that write and keep the saved snapshot.
+func TestSyncGuardRefusesEmptyStartupClobber(t *testing.T) {
+	w := openTestWez(t)
+	mux := "/run/wezterm/mux"
+
+	// Seed a rich saved snapshot: 4 panes, with command + claude state bound.
+	for _, pid := range []int64{1, 12, 13, 20} {
+		if err := w.ApplyPreexec(mux, pid, "claude", "/tmp", 1); err != nil {
+			t.Fatalf("seed %d: %v", pid, err)
+		}
+	}
+	if err := w.BindClaudeSession(mux, 12, "sess-keep", "/tmp"); err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	raw, panes := loadFixture(t)
+	if _, err := Sync(w, raw, panes, mux, time.UnixMilli(1000)); err != nil {
+		t.Fatalf("initial sync: %v", err)
+	}
+	if got := countRows(t, w, "terminal_panes"); got != 4 {
+		t.Fatalf("setup: pane rows = %d, want 4", got)
+	}
+
+	// Now a fresh, empty wezterm (different mux, 1 command-less pane) snapshots.
+	eraw, epanes, emux := helperEmptyStartupPanes()
+	res, err := Sync(w, eraw, epanes, emux, time.UnixMilli(2000))
+	if err != nil {
+		t.Fatalf("empty-startup sync: %v", err)
+	}
+	if !res.SkippedClobber {
+		t.Error("expected SkippedClobber=true on empty-startup snapshot")
+	}
+	if res.DidWork {
+		t.Error("guard should have prevented the destructive write (DidWork=true)")
+	}
+
+	// The saved 4-pane layout MUST still be intact.
+	if got := countRows(t, w, "terminal_panes"); got != 4 {
+		t.Errorf("saved layout was clobbered: pane rows = %d, want 4", got)
+	}
+	if got := countRows(t, w, "terminal_windows"); got != 2 {
+		t.Errorf("saved windows clobbered: %d, want 2", got)
+	}
+	// The linked claude session must survive.
+	var claudeID []byte
+	if err := w.DB().QueryRow(`SELECT claude_session_id FROM terminal_panes WHERE pane_id = 12`).Scan(&claudeID); err != nil {
+		t.Fatalf("query pane 12: %v", err)
+	}
+	if string(claudeID) != "sess-keep" {
+		t.Errorf("claude session lost: %q", claudeID)
+	}
+	// Timestamp should still advance (debounce tracking).
+	meta, _, _ := w.GetSnapshotMeta()
+	if meta.TakenAt != 2000 {
+		t.Errorf("taken_at = %d, want 2000 (touched)", meta.TakenAt)
+	}
+}
+
+// TestSyncGuardAllowsLiveShrink ensures the guard does NOT block a legitimate
+// user-driven shrink: closing a pane mid-session leaves runtime state on the
+// survivors, so the incoming snapshot still carries command state and must be
+// written.
+func TestSyncGuardAllowsLiveShrink(t *testing.T) {
+	w := openTestWez(t)
+	mux := "/run/wezterm/mux"
+
+	for _, pid := range []int64{1, 12, 13, 20} {
+		if err := w.ApplyPreexec(mux, pid, "claude", "/tmp", 1); err != nil {
+			t.Fatalf("seed %d: %v", pid, err)
+		}
+	}
+	raw, panes := loadFixture(t)
+	if _, err := Sync(w, raw, panes, mux, time.UnixMilli(1000)); err != nil {
+		t.Fatalf("initial sync: %v", err)
+	}
+
+	// User closes two panes (same mux; survivors keep their runtime state).
+	smaller := []wezterm.RawPane{panes[0], panes[1]}
+	res, err := Sync(w, []byte(`live-shrink`), smaller, mux, time.UnixMilli(2000))
+	if err != nil {
+		t.Fatalf("shrink sync: %v", err)
+	}
+	if res.SkippedClobber {
+		t.Error("guard wrongly blocked a live shrink with surviving runtime state")
+	}
+	if !res.DidWork {
+		t.Error("live shrink should have been written")
+	}
+	if got := countRows(t, w, "terminal_panes"); got != 2 {
+		t.Errorf("pane rows after shrink = %d, want 2", got)
+	}
+}
+
+// TestSyncGuardAllowsWriteWhenNoSavedState confirms first-run / stateless saved
+// snapshots are always overwritable (nothing meaningful to protect).
+func TestSyncGuardAllowsWriteWhenNoSavedState(t *testing.T) {
+	w := openTestWez(t)
+	// Save a snapshot with NO runtime state (command-less panes).
+	raw, panes := loadFixture(t)
+	if _, err := Sync(w, raw, panes, "/run/wezterm/mux", time.UnixMilli(1000)); err != nil {
+		t.Fatalf("initial sync: %v", err)
+	}
+
+	// A smaller, empty-startup snapshot should be allowed (saved had no state).
+	eraw, epanes, emux := helperEmptyStartupPanes()
+	res, err := Sync(w, eraw, epanes, emux, time.UnixMilli(2000))
+	if err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if res.SkippedClobber {
+		t.Error("guard should not protect a stateless saved snapshot")
+	}
+	if got := countRows(t, w, "terminal_panes"); got != 1 {
+		t.Errorf("pane rows = %d, want 1 (overwrite allowed)", got)
+	}
+}
+
+func TestShouldSkipClobberUnit(t *testing.T) {
+	cases := []struct {
+		name            string
+		saved, incoming store.SnapshotStats
+		want            bool
+	}{
+		{"empty-startup over rich save", store.SnapshotStats{PaneCount: 12, CommandedPanes: 6, ClaudePanes: 6}, store.SnapshotStats{PaneCount: 1}, true},
+		{"nothing saved", store.SnapshotStats{PaneCount: 3}, store.SnapshotStats{PaneCount: 1}, false},
+		{"incoming has command state", store.SnapshotStats{PaneCount: 4, CommandedPanes: 4}, store.SnapshotStats{PaneCount: 2, CommandedPanes: 2}, false},
+		{"incoming larger", store.SnapshotStats{PaneCount: 2, CommandedPanes: 2}, store.SnapshotStats{PaneCount: 5}, false},
+		{"equal size, no incoming state", store.SnapshotStats{PaneCount: 4, CommandedPanes: 4}, store.SnapshotStats{PaneCount: 4}, false},
+	}
+	for _, c := range cases {
+		if got := shouldSkipClobber(c.saved, c.incoming); got != c.want {
+			t.Errorf("%s: shouldSkipClobber = %v, want %v", c.name, got, c.want)
+		}
 	}
 }

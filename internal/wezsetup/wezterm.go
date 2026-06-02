@@ -11,13 +11,13 @@
 // loader block is responsible for ensuring a config is returned:
 //
 //   - No existing config  -> the block builds a config_builder(), applies cst,
-//                            and returns it.
+//     and returns it.
 //   - Existing `return X`  -> the block is inserted *before* that return; if X is
 //     where X is an         a simple identifier we call apply_to_config(X) so the
 //     identifier            keybindings merge into the user's own config.
 //   - Existing `return`    -> we can't reference the returned value, so we only
 //     of a complex expr     `require 'cst'` (event handlers still register); the
-//                           user's config is returned unchanged.
+//     user's config is returned unchanged.
 //
 // Both files are idempotent: re-running setup replaces the loader block and
 // rewrites cst.lua. Uninstall removes both.

@@ -492,3 +492,58 @@ func TestOpenWezReadOnlySeesUncheckpointedWAL(t *testing.T) {
 		t.Error("expected write to be rejected on read-only handle")
 	}
 }
+
+func TestGetSnapshotStats(t *testing.T) {
+	w := testWezStore(t)
+
+	// Empty DB → all zero.
+	s, err := w.GetSnapshotStats()
+	if err != nil {
+		t.Fatalf("GetSnapshotStats empty: %v", err)
+	}
+	if s.PaneCount != 0 || s.CommandedPanes != 0 || s.ClaudePanes != 0 {
+		t.Fatalf("empty stats = %+v, want all zero", s)
+	}
+
+	// Seed a window/tab and 3 panes: one with claude session, one with only a
+	// last_cmd, one bare.
+	if _, err := w.DB().Exec(`INSERT INTO terminal_windows (window_id, workspace, win_index) VALUES (1,'default',0)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.DB().Exec(`INSERT INTO terminal_tabs (tab_id, window_id, tab_index) VALUES (10,1,0)`); err != nil {
+		t.Fatal(err)
+	}
+	rows := []struct {
+		pane              int64
+		lastCmd, claudeID any
+	}{
+		{1, nil, "sess-1"}, // claude + commanded
+		{2, "vim", nil},    // commanded only
+		{3, nil, nil},      // bare
+	}
+	for _, r := range rows {
+		if _, err := w.DB().Exec(
+			`INSERT INTO terminal_panes
+				(pane_id, tab_id, parent_pane_id, split_direction, size_cols, size_rows,
+				 cwd, title, foreground_pid, foreground_name, last_cmd, current_cmd, claude_session_id)
+			 VALUES (?, 10, NULL, NULL, 80, 24, '/p', 't', NULL, NULL, ?, NULL, ?)`,
+			r.pane, r.lastCmd, r.claudeID,
+		); err != nil {
+			t.Fatalf("insert pane %d: %v", r.pane, err)
+		}
+	}
+
+	s, err = w.GetSnapshotStats()
+	if err != nil {
+		t.Fatalf("GetSnapshotStats: %v", err)
+	}
+	if s.PaneCount != 3 {
+		t.Errorf("PaneCount = %d, want 3", s.PaneCount)
+	}
+	if s.CommandedPanes != 2 {
+		t.Errorf("CommandedPanes = %d, want 2", s.CommandedPanes)
+	}
+	if s.ClaudePanes != 1 {
+		t.Errorf("ClaudePanes = %d, want 1", s.ClaudePanes)
+	}
+}
