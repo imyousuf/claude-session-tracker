@@ -205,3 +205,55 @@ func TestIsLikelyEnvKey(t *testing.T) {
 		}
 	}
 }
+
+// --- SendLine (Fix B) ---
+
+func TestResolveSendLineClaude(t *testing.T) {
+	r := NewResolver([]string{"claude"}, []string{"--dangerously-skip-permissions"})
+	plan := r.Resolve(store.WezPane{CWD: "/p", CurrentCmd: "cst", ClaudeSessionID: "abc"})
+	want := "claude --resume abc --dangerously-skip-permissions"
+	if plan.SendLine != want {
+		t.Errorf("SendLine = %q, want %q", plan.SendLine, want)
+	}
+}
+
+func TestResolveSendLineLiteralVerbatim(t *testing.T) {
+	// Literal replay sends the captured line verbatim — no sh -c "exec" wrapper.
+	r := NewResolver([]string{"tomoe"}, nil)
+	plan := r.Resolve(store.WezPane{CWD: "/a", CurrentCmd: "tomoe start --device hw:0,0"})
+	if plan.SendLine != "tomoe start --device hw:0,0" {
+		t.Errorf("SendLine = %q, want verbatim", plan.SendLine)
+	}
+}
+
+func TestResolveSendLineEmptyForPlainShell(t *testing.T) {
+	r := NewResolver([]string{"claude"}, nil)
+	// not in registry → plain shell → no SendLine
+	plan := r.Resolve(store.WezPane{CWD: "/p", CurrentCmd: "vim foo.go"})
+	if plan.SendLine != "" {
+		t.Errorf("SendLine = %q, want empty (plain shell)", plan.SendLine)
+	}
+	// no command captured → plain shell → no SendLine
+	plan = r.Resolve(store.WezPane{CWD: "/p"})
+	if plan.SendLine != "" {
+		t.Errorf("SendLine = %q, want empty (no capture)", plan.SendLine)
+	}
+}
+
+func TestShellJoin(t *testing.T) {
+	cases := []struct {
+		in   []string
+		want string
+	}{
+		{[]string{"claude", "--resume", "abc"}, "claude --resume abc"},
+		{[]string{"a b", "c"}, "'a b' c"},
+		{[]string{"it's"}, `'it'\''s'`},
+		{[]string{""}, "''"},
+		{[]string{"--flag=x,y", "/p/q"}, "--flag=x,y /p/q"},
+	}
+	for _, c := range cases {
+		if got := shellJoin(c.in); got != c.want {
+			t.Errorf("shellJoin(%v) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}

@@ -9,9 +9,15 @@ import (
 // ReplayPlan describes what `cst restore` will spawn in a single pane.
 type ReplayPlan struct {
 	CWD     string   // working directory for the new pane
-	Command []string // empty = default shell
-	Matched string   // diagnostic: which registry name (if any) matched
-	Reason  string   // human-readable reason for the plan, useful for --dry-run
+	Command []string // empty = default shell (used by spawn-with-command callers + dry-run)
+	// SendLine is the literal shell line to TYPE into the pane via send-text
+	// (skeleton-first restore spawns plain shells, then sends this). Empty means
+	// send nothing (plain shell). For claude this is `claude --resume <id> ...`;
+	// for literal replay it's the verbatim captured command (no sh -c wrapper —
+	// we type into an interactive shell).
+	SendLine string
+	Matched  string // diagnostic: which registry name (if any) matched
+	Reason   string // human-readable reason for the plan, useful for --dry-run
 }
 
 // Resolver maps a stored pane to a spawn plan using the user's ReplayCommands.
@@ -72,6 +78,7 @@ func (r *Resolver) Resolve(pane store.WezPane) ReplayPlan {
 		cmd := []string{"claude", "--resume", pane.ClaudeSessionID}
 		cmd = append(cmd, r.claudeArgs...)
 		plan.Command = cmd
+		plan.SendLine = shellJoin(cmd)
 		plan.Matched = name
 		plan.Reason = "claude session " + pane.ClaudeSessionID + " linked (via " + name + "); spawning with --resume"
 		if len(r.claudeArgs) > 0 {
@@ -91,10 +98,45 @@ func (r *Resolver) Resolve(pane store.WezPane) ReplayPlan {
 	}
 	plan.Matched = name
 
-	// Default: replay literal via `sh -c "exec ..."` for quote-safety.
+	// Default: replay the captured command verbatim. Command keeps the
+	// quote-safe sh -c form for spawn-with-command/dry-run callers; SendLine is
+	// the raw line we type into an interactive shell (no wrapper needed).
 	plan.Command = []string{"sh", "-c", "exec " + activeCmd}
+	plan.SendLine = activeCmd
 	plan.Reason = "replaying literal: " + activeCmd
 	return plan
+}
+
+// shellJoin joins argv into a single shell line, quoting any token that contains
+// whitespace or shell metacharacters. Used to turn the claude resume argv into a
+// line we can type via send-text.
+func shellJoin(argv []string) string {
+	parts := make([]string, len(argv))
+	for i, a := range argv {
+		parts[i] = shellQuote(a)
+	}
+	return strings.Join(parts, " ")
+}
+
+// shellQuote single-quotes s if it contains anything outside a safe set, so it
+// survives being typed into an interactive shell verbatim.
+func shellQuote(s string) string {
+	if s == "" {
+		return "''"
+	}
+	safe := true
+	for _, c := range s {
+		isAlnum := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+		if !isAlnum && c != '-' && c != '_' && c != '.' && c != '/' && c != ':' && c != '=' && c != ',' {
+			safe = false
+			break
+		}
+	}
+	if safe {
+		return s
+	}
+	// Wrap in single quotes, escaping embedded single quotes as '\''.
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // claudeLaunchers are command names that launch a Claude session. When a pane
