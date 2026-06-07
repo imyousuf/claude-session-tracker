@@ -57,6 +57,13 @@ func TestInstallCreatesBothFiles(t *testing.T) {
 	if !strings.Contains(string(mod), "function M.apply_to_config") {
 		t.Error("cst.lua missing apply_to_config")
 	}
+	// gui-startup must invoke restore with --spawn-if-empty and point at the log.
+	if !strings.Contains(string(mod), "'restore', '--spawn-if-empty'") {
+		t.Error("cst.lua gui-startup missing restore --spawn-if-empty")
+	}
+	if !strings.Contains(string(mod), "~/.cst/restore.log") {
+		t.Error("cst.lua missing restore.log pointer in gui-startup")
+	}
 }
 
 // TestInstallEmptyReturnsConfig is the regression test for the

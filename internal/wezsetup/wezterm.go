@@ -108,6 +108,9 @@ wezterm.on('gui-startup', function(cmd)
     mux.spawn_window(cmd)
     return
   end
+  -- restore runs detached; its output is discarded by wezterm, so it tees to
+  -- ~/.cst/restore.log. Check there if a boot restore looks wrong.
+  wezterm.log_info('cst restore dispatched; see ~/.cst/restore.log')
   wezterm.background_child_process({ CST, 'restore', '--spawn-if-empty' })
 end)
 
