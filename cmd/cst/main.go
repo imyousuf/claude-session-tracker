@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -718,15 +720,57 @@ window opens when there's no saved layout.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		_, err := snapshot.Restore(ctx, snapshot.RestoreOptions{
+
+		// Tee output to ~/.cst/restore.log so boot-time restores (run detached
+		// from gui-startup, where stdout/stderr are discarded) leave a trace.
+		out := io.Writer(os.Stdout)
+		if logF, err := openRestoreLog(); err == nil {
+			defer func() { _ = logF.Close() }()
+			_, _ = fmt.Fprintf(logF, "\n=== cst restore %s (workspace=%q spawn-if-empty=%v dry-run=%v) ===\n",
+				time.Now().Format(time.RFC3339), flagRestoreWorkspace, flagRestoreSpawnIfEmpty, flagRestoreDryRun)
+			out = io.MultiWriter(os.Stdout, logF)
+		} else {
+			fmt.Fprintf(os.Stderr, "warn: could not open restore log: %v\n", err)
+		}
+
+		res, err := snapshot.Restore(ctx, snapshot.RestoreOptions{
 			WezDBPath:    flagRestoreWezDB,
 			Workspace:    flagRestoreWorkspace,
 			SkipFirst:    flagRestoreSkipFirst,
 			SpawnIfEmpty: flagRestoreSpawnIfEmpty,
 			DryRun:       flagRestoreDryRun,
+			Out:          out,
 		})
-		return err
+		_, _ = fmt.Fprintf(out, "restore summary: %d window(s), %d tab(s), %d split(s), %d command(s) sent, %d skipped, %d error(s)\n",
+			res.WindowsSpawned, res.TabsSpawned, res.PanesSplit, res.CommandsSent, res.PanesSkipped, len(res.Errors))
+		return restoreExitError(res, err)
 	},
+}
+
+// openRestoreLog opens ~/.cst/restore.log for appending, creating ~/.cst if needed.
+func openRestoreLog() (*os.File, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+	dir := filepath.Join(home, store.DefaultDBDir)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
+	}
+	return os.OpenFile(filepath.Join(dir, "restore.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+}
+
+// restoreExitError turns a RestoreResult into a non-nil error when the run hit
+// a hard failure (err) or any per-pane errors, so the process exits non-zero and
+// failures are visible (the old code discarded res and always exited 0).
+func restoreExitError(res snapshot.RestoreResult, err error) error {
+	if err != nil {
+		return err
+	}
+	if len(res.Errors) > 0 {
+		return fmt.Errorf("restore completed with %d error(s)", len(res.Errors))
+	}
+	return nil
 }
 
 func init() {
