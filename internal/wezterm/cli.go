@@ -17,6 +17,9 @@ import (
 // Runner abstracts the actual `wezterm cli ...` invocation so tests can inject fakes.
 type Runner interface {
 	Run(args ...string) ([]byte, error)
+	// RunStdin runs `wezterm cli args...` with stdin fed from the given string.
+	// Used by send-text so arbitrary command text bypasses shell-arg quoting.
+	RunStdin(stdin string, args ...string) ([]byte, error)
 }
 
 // CmdRunner runs `wezterm cli ...` via os/exec. Used in production.
@@ -30,6 +33,16 @@ func (r CmdRunner) Run(args ...string) ([]byte, error) {
 		bin = "wezterm"
 	}
 	cmd := exec.Command(bin, append([]string{"cli"}, args...)...)
+	return cmd.Output()
+}
+
+func (r CmdRunner) RunStdin(stdin string, args ...string) ([]byte, error) {
+	bin := r.Bin
+	if bin == "" {
+		bin = "wezterm"
+	}
+	cmd := exec.Command(bin, append([]string{"cli"}, args...)...)
+	cmd.Stdin = strings.NewReader(stdin)
 	return cmd.Output()
 }
 
@@ -210,4 +223,29 @@ func SplitPane(args SplitArgs) (int64, error) {
 
 func parsePaneID(out []byte) (int64, error) {
 	return strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+}
+
+// --- send-text ---
+
+// SendTextArgs configures a `wezterm cli send-text` call.
+type SendTextArgs struct {
+	PaneID  int64
+	Text    string // sent verbatim; include a trailing "\r" to submit a shell line
+	NoPaste bool   // --no-paste: deliver as plain keystrokes, not a bracketed paste
+}
+
+// SendText types Text into the given pane via `wezterm cli send-text`. The text
+// is fed on stdin (not as an argument) so arbitrary command lines aren't subject
+// to shell-arg quoting. With NoPaste set and a trailing carriage return, the
+// shell in the target pane executes the line (verified empirically: bracketed
+// paste does NOT submit, plain keystrokes + "\r" do).
+func SendText(args SendTextArgs) error {
+	a := []string{"send-text", "--pane-id", strconv.FormatInt(args.PaneID, 10)}
+	if args.NoPaste {
+		a = append(a, "--no-paste")
+	}
+	if _, err := DefaultRunner.RunStdin(args.Text, a...); err != nil {
+		return fmt.Errorf("wezterm cli send-text: %w", err)
+	}
+	return nil
 }

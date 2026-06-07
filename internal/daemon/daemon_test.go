@@ -29,6 +29,10 @@ func (f *fakeWezterm) Run(args ...string) ([]byte, error) {
 	return nil, nil
 }
 
+func (f *fakeWezterm) RunStdin(_ string, args ...string) ([]byte, error) {
+	return f.Run(args...)
+}
+
 func setupDaemon(t *testing.T, coalesce time.Duration) (*Daemon, *fakeWezterm, string) {
 	t.Helper()
 	dir := t.TempDir()

@@ -62,13 +62,23 @@ func SampleListJSON() []byte { return []byte(sampleListJSON) }
 
 // fakeRunner records args and returns canned output.
 type fakeRunner struct {
-	calls    [][]string
-	response map[string][]byte // keyed by joined args; default if unmatched
-	err      error
+	calls       [][]string
+	stdinByCall []string          // stdin passed to each call ("" for plain Run)
+	response    map[string][]byte // keyed by joined args; default if unmatched
+	err         error
 }
 
 func (f *fakeRunner) Run(args ...string) ([]byte, error) {
+	return f.record("", args)
+}
+
+func (f *fakeRunner) RunStdin(stdin string, args ...string) ([]byte, error) {
+	return f.record(stdin, args)
+}
+
+func (f *fakeRunner) record(stdin string, args []string) ([]byte, error) {
 	f.calls = append(f.calls, append([]string(nil), args...))
+	f.stdinByCall = append(f.stdinByCall, stdin)
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -261,6 +271,48 @@ func TestSplitPaneInvalidDirection(t *testing.T) {
 	_, err := SplitPane(SplitArgs{PaneID: 1, Direction: "diagonal"})
 	if err == nil {
 		t.Fatal("expected error for invalid direction")
+	}
+}
+
+func TestSendText(t *testing.T) {
+	f := &fakeRunner{response: map[string][]byte{"": nil}}
+	restore := SetRunner(f)
+	defer restore()
+
+	if err := SendText(SendTextArgs{PaneID: 7, Text: "echo hi\r", NoPaste: true}); err != nil {
+		t.Fatalf("SendText: %v", err)
+	}
+	want := []string{"send-text", "--pane-id", "7", "--no-paste"}
+	if !reflect.DeepEqual(f.calls[0], want) {
+		t.Errorf("args = %v, want %v", f.calls[0], want)
+	}
+	// Text must be delivered via stdin, not as an argument.
+	if f.stdinByCall[0] != "echo hi\r" {
+		t.Errorf("stdin = %q, want %q", f.stdinByCall[0], "echo hi\r")
+	}
+}
+
+func TestSendTextWithoutNoPaste(t *testing.T) {
+	f := &fakeRunner{response: map[string][]byte{"": nil}}
+	restore := SetRunner(f)
+	defer restore()
+
+	if err := SendText(SendTextArgs{PaneID: 3, Text: "ls\r"}); err != nil {
+		t.Fatalf("SendText: %v", err)
+	}
+	want := []string{"send-text", "--pane-id", "3"}
+	if !reflect.DeepEqual(f.calls[0], want) {
+		t.Errorf("args = %v, want %v", f.calls[0], want)
+	}
+}
+
+func TestSendTextError(t *testing.T) {
+	f := &fakeRunner{err: fmt.Errorf("boom")}
+	restore := SetRunner(f)
+	defer restore()
+
+	if err := SendText(SendTextArgs{PaneID: 1, Text: "x\r", NoPaste: true}); err == nil {
+		t.Fatal("expected error from SendText")
 	}
 }
 
