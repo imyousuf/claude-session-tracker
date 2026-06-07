@@ -1,6 +1,7 @@
 package snapshot
 
 import (
+	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
@@ -517,4 +518,123 @@ func TestShouldSkipClobberUnit(t *testing.T) {
 			t.Errorf("%s: shouldSkipClobber = %v, want %v", c.name, got, c.want)
 		}
 	}
+}
+
+// --- Split geometry capture (Fix A) ---
+
+// tomoeTabPanes builds the real tomoe layout from the user's machine:
+//
+//	A: full-height left column
+//	B: top-right
+//	C: bottom-right (vertical split of the right column)
+//
+// Geometry uses the confirmed divider gap of 1 cell.
+func tomoeTabPanes() []wezterm.RawPane {
+	return []wezterm.RawPane{
+		{WindowID: 1, TabID: 1, PaneID: 1, Workspace: "default",
+			LeftCol: 0, TopRow: 0, Size: wezterm.Size{Cols: 122, Rows: 59},
+			CWD: "file://host/proj/tomoe/"},
+		{WindowID: 1, TabID: 1, PaneID: 2, Workspace: "default",
+			LeftCol: 123, TopRow: 0, Size: wezterm.Size{Cols: 124, Rows: 30},
+			CWD: "file://host/proj/tomoe/"},
+		{WindowID: 1, TabID: 1, PaneID: 15, Workspace: "default",
+			LeftCol: 123, TopRow: 31, Size: wezterm.Size{Cols: 124, Rows: 28},
+			CWD: "file://host/proj/tomoe/"},
+	}
+}
+
+func TestBuildTreeInfersSplits(t *testing.T) {
+	tree := buildTree(tomoeTabPanes())
+	if len(tree.Windows) != 1 || len(tree.Windows[0].Tabs) != 1 {
+		t.Fatalf("expected 1 window/1 tab, got %d/%d", len(tree.Windows), len(tree.Windows[0].Tabs))
+	}
+	byID := map[int64]store.WezPane{}
+	for _, p := range tree.Windows[0].Tabs[0].Panes {
+		byID[p.PaneID] = p
+	}
+
+	// A (pane 1) is the tab lead: no parent.
+	if a := byID[1]; a.ParentPaneID != nil || a.SplitDirection != "" {
+		t.Errorf("lead pane 1: parent=%v dir=%q, want nil/\"\"", a.ParentPaneID, a.SplitDirection)
+	}
+	// B (pane 2) is a right split of A.
+	if b := byID[2]; b.ParentPaneID == nil || *b.ParentPaneID != 1 || b.SplitDirection != "right" {
+		t.Errorf("pane 2: parent=%v dir=%q, want parent=1 dir=right", ptr(b.ParentPaneID), b.SplitDirection)
+	}
+	// C (pane 15) is a bottom split of B — NOT of the full-height A.
+	if c := byID[15]; c.ParentPaneID == nil || *c.ParentPaneID != 2 || c.SplitDirection != "bottom" {
+		t.Errorf("pane 15: parent=%v dir=%q, want parent=2 dir=bottom", ptr(c.ParentPaneID), c.SplitDirection)
+	}
+}
+
+func TestBuildTreeSinglePaneNoParent(t *testing.T) {
+	tree := buildTree([]wezterm.RawPane{
+		{WindowID: 0, TabID: 1, PaneID: 1, Workspace: "default",
+			Size: wezterm.Size{Cols: 100, Rows: 30}, CWD: "file://host/x/"},
+	})
+	p := tree.Windows[0].Tabs[0].Panes[0]
+	if p.ParentPaneID != nil || p.SplitDirection != "" {
+		t.Errorf("single pane: parent=%v dir=%q, want nil/\"\"", p.ParentPaneID, p.SplitDirection)
+	}
+}
+
+func TestBuildTreeFallbackOnZeroGeometry(t *testing.T) {
+	// All-zero geometry (degenerate / synthetic) → non-lead panes hang off the
+	// lead, split right. No pane dropped.
+	tree := buildTree([]wezterm.RawPane{
+		{WindowID: 0, TabID: 1, PaneID: 1, Workspace: "default", CWD: "file://host/x/"},
+		{WindowID: 0, TabID: 1, PaneID: 2, Workspace: "default", CWD: "file://host/x/"},
+		{WindowID: 0, TabID: 1, PaneID: 3, Workspace: "default", CWD: "file://host/x/"},
+	})
+	byID := map[int64]store.WezPane{}
+	for _, p := range tree.Windows[0].Tabs[0].Panes {
+		byID[p.PaneID] = p
+	}
+	// Lead is the smallest pane_id (all geometry equal → tie-break by id).
+	if byID[1].ParentPaneID != nil {
+		t.Errorf("expected pane 1 to be lead, got parent=%v", byID[1].ParentPaneID)
+	}
+	for _, id := range []int64{2, 3} {
+		p := byID[id]
+		if p.ParentPaneID == nil || *p.ParentPaneID != 1 || p.SplitDirection != "right" {
+			t.Errorf("pane %d fallback: parent=%v dir=%q, want parent=1 dir=right", id, ptr(p.ParentPaneID), p.SplitDirection)
+		}
+	}
+}
+
+func TestSyncPersistsSplits(t *testing.T) {
+	w := openTestWez(t)
+	if _, err := Sync(w, []byte("tomoe-tab"), tomoeTabPanes(), "/run/mux", time.UnixMilli(1000)); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	// Regression vs the old hardcoded NULL: B/C rows must carry parent+direction.
+	type row struct {
+		parent sql.NullInt64
+		dir    sql.NullString
+	}
+	get := func(pane int64) row {
+		var r row
+		if err := w.DB().QueryRow(
+			`SELECT parent_pane_id, split_direction FROM terminal_panes WHERE pane_id = ?`, pane,
+		).Scan(&r.parent, &r.dir); err != nil {
+			t.Fatalf("query pane %d: %v", pane, err)
+		}
+		return r
+	}
+	if r := get(1); r.parent.Valid {
+		t.Errorf("pane 1 parent should be NULL, got %d", r.parent.Int64)
+	}
+	if r := get(2); !r.parent.Valid || r.parent.Int64 != 1 || r.dir.String != "right" {
+		t.Errorf("pane 2 persisted parent=%v dir=%q, want 1/right", r.parent, r.dir.String)
+	}
+	if r := get(15); !r.parent.Valid || r.parent.Int64 != 2 || r.dir.String != "bottom" {
+		t.Errorf("pane 15 persisted parent=%v dir=%q, want 2/bottom", r.parent, r.dir.String)
+	}
+}
+
+func ptr(p *int64) any {
+	if p == nil {
+		return nil
+	}
+	return *p
 }

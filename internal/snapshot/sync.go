@@ -133,8 +133,9 @@ func Sync(w *store.WezStore, raw []byte, panes []wezterm.RawPane, muxSocket stri
 						size_cols, size_rows, cwd, title,
 						foreground_pid, foreground_name,
 						last_cmd, current_cmd, claude_session_id
-					) VALUES (?, ?, NULL, NULL, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)`,
+					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)`,
 					pane.PaneID, pane.TabID,
+					nullableInt64Ptr(pane.ParentPaneID), nullableString(pane.SplitDirection),
 					pane.SizeCols, pane.SizeRows, pane.CWD, pane.Title,
 					nullableString(rs.LastCommand),
 					nullableString(rs.CurrentCommand),
@@ -230,17 +231,22 @@ func shouldSkipClobber(saved, incoming store.SnapshotStats) bool {
 
 // buildTree groups flat panes from `wezterm cli list` into windows → tabs → panes.
 // Window/tab order is the order they were first seen in the input (which is
-// wezterm's stable enumeration order). Tab index is per-window.
+// wezterm's stable enumeration order). Tab index is per-window. Within each tab,
+// pane split structure (parent_pane_id + split_direction) is inferred from the
+// captured geometry (left_col/top_row/size) by inferTabSplits.
 func buildTree(panes []wezterm.RawPane) store.WezTree {
 	type tabKey struct{ winID, tabID int64 }
 
 	winSeen := map[int64]int{}  // window_id -> index in tree.Windows
 	tabSeen := map[tabKey]int{} // tab_key -> index in window.Tabs
 
+	// Collect raw panes per tab (preserving first-seen order) so geometry is in
+	// hand when we infer splits.
+	rawByTab := map[tabKey][]wezterm.RawPane{}
+
 	var tree store.WezTree
 
 	for _, p := range panes {
-		// Window: create if first time seen.
 		winIdx, ok := winSeen[p.WindowID]
 		if !ok {
 			winIdx = len(tree.Windows)
@@ -252,11 +258,9 @@ func buildTree(panes []wezterm.RawPane) store.WezTree {
 			})
 		}
 
-		// Tab: create if first time seen.
 		key := tabKey{p.WindowID, p.TabID}
-		tabIdx, ok := tabSeen[key]
-		if !ok {
-			tabIdx = len(tree.Windows[winIdx].Tabs)
+		if _, ok := tabSeen[key]; !ok {
+			tabIdx := len(tree.Windows[winIdx].Tabs)
 			tabSeen[key] = tabIdx
 			tree.Windows[winIdx].Tabs = append(tree.Windows[winIdx].Tabs, store.WezTab{
 				TabID:    p.TabID,
@@ -264,23 +268,138 @@ func buildTree(panes []wezterm.RawPane) store.WezTree {
 				TabIndex: tabIdx,
 			})
 		}
+		rawByTab[key] = append(rawByTab[key], p)
+	}
 
-		// Pane.
-		tree.Windows[winIdx].Tabs[tabIdx].Panes = append(
-			tree.Windows[winIdx].Tabs[tabIdx].Panes,
-			store.WezPane{
-				PaneID:   p.PaneID,
-				TabID:    p.TabID,
-				SizeCols: p.Size.Cols,
-				SizeRows: p.Size.Rows,
-				CWD:      wezterm.ParseCWD(p.CWD),
-				Title:    p.Title,
-				// foreground_pid/name not set: wezterm cli list doesn't expose them.
-				// Splits not detected here either; left for v2.
-			},
-		)
+	// Second pass: build panes per tab with inferred parent/direction.
+	for wi := range tree.Windows {
+		win := &tree.Windows[wi]
+		for ti := range win.Tabs {
+			tab := &win.Tabs[ti]
+			tabPanes := rawByTab[tabKey{win.WindowID, tab.TabID}]
+			splits := inferTabSplits(tabPanes)
+			for _, p := range tabPanes {
+				s := splits[p.PaneID]
+				tab.Panes = append(tab.Panes, store.WezPane{
+					PaneID:         p.PaneID,
+					TabID:          p.TabID,
+					ParentPaneID:   s.parent,
+					SplitDirection: s.dir,
+					SizeCols:       p.Size.Cols,
+					SizeRows:       p.Size.Rows,
+					CWD:            wezterm.ParseCWD(p.CWD),
+					Title:          p.Title,
+					// foreground_pid/name not set: wezterm cli list doesn't expose them.
+				})
+			}
+		}
 	}
 	return tree
+}
+
+// paneSplit is the inferred split relationship for one pane within its tab.
+type paneSplit struct {
+	parent *int64 // nil = tab lead (no parent)
+	dir    string // "" for lead; else right/bottom/left/top relative to parent
+}
+
+// inferTabSplits derives each pane's parent + split direction from wezterm
+// geometry (left_col/top_row/size). The top-left-most pane is the tab lead
+// (parent=nil). Every other pane is attached to the nearest sibling it is
+// edge-adjacent to (a divider gap of ~1 cell), preferring the sibling whose
+// perpendicular band most tightly matches — so a column that is itself split
+// vertically chains B→C rather than both hanging off the full-height lead.
+//
+// Panes that don't match any adjacency (zero/degenerate geometry, e.g. older
+// wezterm or synthetic test data) fall back to "right split off the tab lead",
+// which reproduces the pre-geometry behavior and never drops a pane.
+func inferTabSplits(panes []wezterm.RawPane) map[int64]paneSplit {
+	out := make(map[int64]paneSplit, len(panes))
+	if len(panes) == 0 {
+		return out
+	}
+
+	// Tab lead = smallest (top_row, left_col), tie-broken by pane_id for stability.
+	leadIdx := 0
+	for i := 1; i < len(panes); i++ {
+		if less := paneBefore(panes[i], panes[leadIdx]); less {
+			leadIdx = i
+		}
+	}
+	lead := panes[leadIdx]
+	out[lead.PaneID] = paneSplit{parent: nil, dir: ""}
+
+	const tol = 1 // wezterm split divider is 1 cell (confirmed empirically)
+
+	for i, p := range panes {
+		if i == leadIdx {
+			continue
+		}
+		bestParent := int64(-1)
+		bestDir := ""
+		bestScore := 1 << 30 // lower = tighter perpendicular band match
+
+		for j, q := range panes {
+			if j == i {
+				continue
+			}
+			pl, pt := p.LeftCol, p.TopRow
+			pc, pr := p.Size.Cols, p.Size.Rows
+			ql, qt := q.LeftCol, q.TopRow
+			qc, qr := q.Size.Cols, q.Size.Rows
+
+			// P is a RIGHT split of Q: P starts just past Q's right edge and
+			// their row bands overlap.
+			if abs(pl-(ql+qc)) <= tol && bandsOverlap(pt, pr, qt, qr) {
+				score := abs(pt-qt) + abs((pt+pr)-(qt+qr)) // row-band mismatch
+				if score < bestScore {
+					bestScore, bestParent, bestDir = score, q.PaneID, "right"
+				}
+			}
+			// P is a BOTTOM split of Q: P starts just past Q's bottom edge and
+			// their column bands overlap.
+			if abs(pt-(qt+qr)) <= tol && bandsOverlap(pl, pc, ql, qc) {
+				score := abs(pl-ql) + abs((pl+pc)-(ql+qc)) // col-band mismatch
+				if score < bestScore {
+					bestScore, bestParent, bestDir = score, q.PaneID, "bottom"
+				}
+			}
+		}
+
+		if bestParent < 0 {
+			// Fallback: hang off the tab lead, split right. Reproduces the
+			// pre-geometry behavior; never drops a pane.
+			lp := lead.PaneID
+			out[p.PaneID] = paneSplit{parent: &lp, dir: "right"}
+			continue
+		}
+		bp := bestParent
+		out[p.PaneID] = paneSplit{parent: &bp, dir: bestDir}
+	}
+	return out
+}
+
+// paneBefore reports whether a sorts before b by (top_row, left_col, pane_id).
+func paneBefore(a, b wezterm.RawPane) bool {
+	if a.TopRow != b.TopRow {
+		return a.TopRow < b.TopRow
+	}
+	if a.LeftCol != b.LeftCol {
+		return a.LeftCol < b.LeftCol
+	}
+	return a.PaneID < b.PaneID
+}
+
+// bandsOverlap reports whether [aStart, aStart+aLen) overlaps [bStart, bStart+bLen).
+func bandsOverlap(aStart, aLen, bStart, bLen int) bool {
+	return aStart < bStart+bLen && bStart < aStart+aLen
+}
+
+func abs(n int) int {
+	if n < 0 {
+		return -n
+	}
+	return n
 }
 
 func hashContent(raw []byte) string {
@@ -367,4 +486,11 @@ func nullableString(s string) any {
 		return nil
 	}
 	return s
+}
+
+func nullableInt64Ptr(p *int64) any {
+	if p == nil {
+		return nil
+	}
+	return *p
 }
