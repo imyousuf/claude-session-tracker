@@ -52,6 +52,43 @@ func TestHandleSessionStartNew(t *testing.T) {
 	}
 }
 
+func TestHandleCodexSessionStartRecordsProvider(t *testing.T) {
+	s := testStore(t)
+	input := HookInput{
+		SessionID:     "thr_codex_123",
+		Provider:      store.ProviderCodex,
+		AgentPID:      4242,
+		MuxSocket:     "/run/mux",
+		PaneID:        18,
+		CWD:           "/home/user/project",
+		HookEventName: "SessionStart",
+		Source:        "startup",
+		Model:         "gpt-5.4",
+	}
+	if err := HandleSessionStart(s, input); err != nil {
+		t.Fatalf("HandleSessionStart: %v", err)
+	}
+	sessions, err := s.ListAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("sessions = %d, want 1", len(sessions))
+	}
+	if sessions[0].Provider != store.ProviderCodex {
+		t.Errorf("provider = %q, want codex", sessions[0].Provider)
+	}
+	if sessions[0].ID != "thr_codex_123" {
+		t.Errorf("id = %q", sessions[0].ID)
+	}
+	if sessions[0].PID == nil || *sessions[0].PID != 4242 {
+		t.Errorf("Codex frontend PID = %v, want 4242", sessions[0].PID)
+	}
+	if sessions[0].ActiveMuxSocket != "/run/mux" || sessions[0].ActivePaneID == nil || *sessions[0].ActivePaneID != 18 {
+		t.Errorf("Codex attachment = %q/%v", sessions[0].ActiveMuxSocket, sessions[0].ActivePaneID)
+	}
+}
+
 func TestHandleSessionStartResume(t *testing.T) {
 	s := testStore(t)
 
@@ -229,8 +266,47 @@ func TestHandleSessionEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListAll: %v", err)
 	}
-	if sessions[0].Active {
-		t.Error("session should be inactive after SessionEnd")
+	if !sessions[0].Active {
+		t.Error("SessionEnd should not change client attachment state")
+	}
+	if sessions[0].LifecycleEndedAt == nil {
+		t.Error("SessionEnd should record lifecycle-ended timestamp")
+	}
+}
+
+func TestStaleSessionEndDoesNotClearResumedAttachment(t *testing.T) {
+	s := testStore(t)
+
+	if err := HandleSessionStart(s, HookInput{
+		SessionID: "codex-1", Provider: store.ProviderCodex, CWD: "/proj",
+		HookEventName: "SessionStart", MuxSocket: "/run/old", PaneID: 18,
+	}); err != nil {
+		t.Fatalf("old HandleSessionStart: %v", err)
+	}
+	if err := HandleSessionStart(s, HookInput{
+		SessionID: "codex-1", Provider: store.ProviderCodex, CWD: "/proj",
+		HookEventName: "SessionStart", MuxSocket: "/run/new", PaneID: 22,
+	}); err != nil {
+		t.Fatalf("resumed HandleSessionStart: %v", err)
+	}
+
+	if err := HandleSessionEnd(s, HookInput{
+		SessionID: "codex-1", Provider: store.ProviderCodex,
+		HookEventName: "SessionEnd", MuxSocket: "/run/old", PaneID: 18,
+	}); err != nil {
+		t.Fatalf("stale HandleSessionEnd: %v", err)
+	}
+
+	sessions, err := s.ListAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := sessions[0]
+	if !got.Active || got.ActivePaneID == nil || *got.ActivePaneID != 22 {
+		t.Fatalf("stale SessionEnd changed resumed attachment: %+v", got)
+	}
+	if got.LifecycleEndedAt == nil {
+		t.Fatalf("SessionEnd did not record the separate lifecycle event: %+v", got)
 	}
 }
 

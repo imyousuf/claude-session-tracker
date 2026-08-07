@@ -16,11 +16,13 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/spf13/cobra"
 
+	"github.com/imyousuf/claude-session-tracker/internal/codexsetup"
 	"github.com/imyousuf/claude-session-tracker/internal/config"
 	"github.com/imyousuf/claude-session-tracker/internal/daemon"
 	"github.com/imyousuf/claude-session-tracker/internal/daemonsetup"
 	"github.com/imyousuf/claude-session-tracker/internal/hook"
 	"github.com/imyousuf/claude-session-tracker/internal/launcher"
+	"github.com/imyousuf/claude-session-tracker/internal/procutil"
 	"github.com/imyousuf/claude-session-tracker/internal/shellsetup"
 	"github.com/imyousuf/claude-session-tracker/internal/snapshot"
 	"github.com/imyousuf/claude-session-tracker/internal/store"
@@ -42,16 +44,17 @@ func main() {
 }
 
 var (
-	flagAll     bool
-	flagProject string
-	flagDays    int
-	flagJSON    bool
+	flagAll      bool
+	flagProject  string
+	flagDays     int
+	flagJSON     bool
+	flagProvider string
 )
 
 var rootCmd = &cobra.Command{
-	Use:   "cst [-- claude-args...]",
-	Short: "Claude Session Tracker - track and resume Claude Code sessions",
-	Long:  "A tool that tracks Claude Code sessions via lifecycle hooks and provides a TUI launcher to browse and resume previous sessions.\n\nAny arguments after -- are passed through to the claude CLI on resume.",
+	Use:   "cst [-- resume-args...]",
+	Short: "Coding Session Tracker - track and resume coding-agent sessions",
+	Long:  "A tool that tracks Claude Code and Codex sessions via lifecycle hooks and provides a TUI launcher to browse and resume previous sessions.\n\nAny arguments after -- are passed through to the selected provider CLI on resume.",
 	RunE:  launchTUI,
 	Args:  cobra.ArbitraryArgs,
 }
@@ -68,6 +71,7 @@ func init() {
 	rootCmd.AddCommand(daemonStatusCmd)
 	rootCmd.AddCommand(restoreCmd)
 	rootCmd.AddCommand(setupShellCmd)
+	rootCmd.AddCommand(setupCodexCmd)
 	rootCmd.AddCommand(setupWeztermCmd)
 	rootCmd.AddCommand(setupDaemonCmd)
 	rootCmd.AddCommand(setupCmd)
@@ -86,11 +90,75 @@ func init() {
 	cleanupCmd.Flags().IntVar(&flagDays, "days", 30, "Remove inactive sessions older than N days")
 }
 
+// --- Setup-Codex Command ---
+
+var (
+	flagSetupCodexPath      string
+	flagSetupCodexPrint     bool
+	flagSetupCodexUninstall bool
+)
+
+var setupCodexCmd = &cobra.Command{
+	Use:   "setup-codex",
+	Short: "Install (or remove) CST lifecycle hooks for Codex CLI",
+	Long: `Merge CST's SessionStart, UserPromptSubmit, and SessionEnd hooks into
+$CODEX_HOME/hooks.json (normally ~/.codex/hooks.json). Existing Codex hooks are
+preserved. Re-running is idempotent.
+
+After installation, start Codex and use /hooks to review and trust the new
+command hooks. Codex skips non-managed hooks until they are trusted.`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		opts := codexsetup.Options{Path: flagSetupCodexPath}
+		if flagSetupCodexPrint {
+			data, err := codexsetup.Render("")
+			if err != nil {
+				return err
+			}
+			fmt.Print(string(data))
+			return nil
+		}
+		if flagSetupCodexUninstall {
+			res, err := codexsetup.Uninstall(opts)
+			if err != nil {
+				return err
+			}
+			if res.Changed {
+				fmt.Printf("Removed CST Codex hooks from %s\n", res.Path)
+			} else {
+				fmt.Printf("No CST Codex hooks found in %s\n", res.Path)
+			}
+			return nil
+		}
+
+		res, err := codexsetup.Install(opts)
+		if err != nil {
+			return err
+		}
+		if res.Changed {
+			fmt.Printf("Installed CST Codex hooks into %s\n", res.Path)
+		} else {
+			fmt.Printf("CST Codex hooks already current in %s\n", res.Path)
+		}
+		fmt.Println("\nNext step: start Codex, run /hooks, and trust the CST hooks.")
+		fmt.Println("If upgrading an older build, also restart cst-daemon (or run `cst setup-daemon --enable`).")
+		return nil
+	},
+}
+
+func init() {
+	setupCodexCmd.Flags().StringVar(&flagSetupCodexPath, "hooks-file", "",
+		"Codex hooks.json path (defaults to $CODEX_HOME/hooks.json)")
+	setupCodexCmd.Flags().BoolVar(&flagSetupCodexPrint, "print", false,
+		"Print the standalone CST hooks document without writing")
+	setupCodexCmd.Flags().BoolVar(&flagSetupCodexUninstall, "uninstall", false,
+		"Remove only CST-owned hooks from Codex hooks.json")
+}
+
 // --- Hook Commands ---
 
 var hookCmd = &cobra.Command{
 	Use:   "hook",
-	Short: "Hook handlers called by Claude Code lifecycle events",
+	Short: "Hook handlers called by coding-agent lifecycle events",
 }
 
 func init() {
@@ -99,6 +167,8 @@ func init() {
 	hookCmd.AddCommand(hookSessionEndCmd)
 	hookCmd.AddCommand(hookPreexecCmd)
 	hookCmd.AddCommand(hookPrecmdCmd)
+	hookCmd.PersistentFlags().StringVar(&flagProvider, "provider", store.ProviderClaude,
+		"Coding-agent provider emitting the hook (claude or codex)")
 }
 
 var hookSessionStartCmd = &cobra.Command{
@@ -188,15 +258,16 @@ var hookPrecmdCmd = &cobra.Command{
 // pushSessionEventIfInWezterm pushes a SessionStart/End event to the daemon
 // when the current process is inside a wezterm pane. Best-effort.
 func pushSessionEventIfInWezterm(t daemon.EventType, input hook.HookInput) {
-	if !wezterm.InWezterm() {
+	if input.MuxSocket == "" || input.PaneID == 0 {
 		return
 	}
 	ev := daemon.Event{
 		Type:      t,
-		MuxSocket: wezterm.MuxSocket(),
-		PaneID:    wezterm.PaneID(),
+		MuxSocket: input.MuxSocket,
+		PaneID:    input.PaneID,
 		SessionID: input.SessionID,
-		PID:       os.Getppid(),
+		Provider:  store.NormalizeProvider(input.Provider),
+		PID:       input.AgentPID,
 		CWD:       input.CWD,
 	}
 	_ = daemon.PushEvent(ev)
@@ -211,6 +282,17 @@ func runHookReturningInput(handler func(*store.Store, hook.HookInput) error) (ho
 	input, err := hook.ReadInput(os.Stdin)
 	if err != nil {
 		return input, err
+	}
+	input.Provider = store.NormalizeProvider(flagProvider)
+	if input.Provider == store.ProviderCodex && input.HookEventName != "SessionEnd" {
+		if attachment, ok := procutil.FindAgentAttachment(input.Provider, input.SessionID, input.CWD); ok {
+			input.AgentPID = attachment.PID
+			input.MuxSocket = attachment.MuxSocket
+			input.PaneID = attachment.PaneID
+		}
+	} else if wezterm.InWezterm() {
+		input.MuxSocket = wezterm.MuxSocket()
+		input.PaneID = wezterm.PaneID()
 	}
 
 	s, err := store.Open(store.DefaultDBPath())
@@ -269,34 +351,59 @@ func launchTUI(cmd *cobra.Command, args []string) error {
 		return nil // User quit without selecting
 	}
 
-	return resumeSession(result.SessionID, result.Project, args)
+	return resumeSession(result.SessionID, result.Provider, result.Project, args)
 }
 
-func resumeSession(sessionID, project string, extraArgs []string) error {
-	// Load config for additional claude args
+func resumeSession(sessionID, provider, project string, extraArgs []string) error {
+	provider = store.NormalizeProvider(provider)
+
+	// Load config for additional Claude-only args.
 	cfg, err := config.Load(config.DefaultConfigPath())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: could not load config: %v\n", err)
 	}
 
-	// Build claude command: claude --resume <id> [config args] [-- extra args]
-	claudeArgs := []string{"claude", "--resume", sessionID}
-	claudeArgs = append(claudeArgs, cfg.ClaudeArgs()...)
-	claudeArgs = append(claudeArgs, extraArgs...)
+	binName, resumeArgs, err := buildResumeCommand(sessionID, provider, cfg, extraArgs)
+	if err != nil {
+		return err
+	}
 
-	fmt.Printf("Resuming session %s...\n", sessionID[:8])
+	shortID := sessionID
+	if len(shortID) > 8 {
+		shortID = shortID[:8]
+	}
+	fmt.Printf("Resuming %s session %s...\n", provider, shortID)
 
 	// Change to the project directory
 	if err := os.Chdir(project); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: could not cd to %s: %v\n", project, err)
 	}
 
-	claudeBin, err := exec.LookPath("claude")
+	providerBin, err := exec.LookPath(binName)
 	if err != nil {
-		return fmt.Errorf("claude not found in PATH: %w", err)
+		return fmt.Errorf("%s not found in PATH: %w", binName, err)
 	}
 
-	return syscall.Exec(claudeBin, claudeArgs, os.Environ())
+	return syscall.Exec(providerBin, resumeArgs, os.Environ())
+}
+
+func buildResumeCommand(sessionID, provider string, cfg config.Config, extraArgs []string) (string, []string, error) {
+	provider = store.NormalizeProvider(provider)
+	var binName string
+	var resumeArgs []string
+	switch provider {
+	case store.ProviderClaude:
+		binName = "claude"
+		resumeArgs = []string{"claude", "--resume", sessionID}
+		resumeArgs = append(resumeArgs, cfg.ClaudeArgs()...)
+	case store.ProviderCodex:
+		binName = "codex"
+		resumeArgs = []string{"codex", "resume", sessionID}
+	default:
+		return "", nil, fmt.Errorf("cannot resume unsupported provider %q", provider)
+	}
+	resumeArgs = append(resumeArgs, extraArgs...)
+	return binName, resumeArgs, nil
 }
 
 // --- List Command ---
@@ -341,12 +448,12 @@ var listCmd = &cobra.Command{
 		}
 
 		// Table output
-		fmt.Printf("%-8s  %-8s  %-10s  %-14s  %s\n", "STATUS", "ID", "LAST SEEN", "MODEL", "LAST PROMPT")
-		fmt.Println("--------  --------  ----------  --------------  -----------")
+		fmt.Printf("%-8s  %-7s  %-8s  %-10s  %-14s  %s\n", "STATUS", "AGENT", "ID", "LAST SEEN", "MODEL", "LAST PROMPT")
+		fmt.Println("--------  -------  --------  ----------  --------------  -----------")
 		for _, sess := range sessions {
-			status := "inactive"
+			status := "idle"
 			if sess.Active {
-				status = "ACTIVE"
+				status = "ATTACHED"
 			}
 			idShort := sess.ID
 			if len(idShort) > 8 {
@@ -364,50 +471,42 @@ var listCmd = &cobra.Command{
 			if len(prompt) > 60 {
 				prompt = prompt[:57] + "..."
 			}
-			fmt.Printf("%-8s  %-8s  %-10s  %-14s  %s\n", status, idShort, relTime, model, prompt)
+			fmt.Printf("%-8s  %-7s  %-8s  %-10s  %-14s  %s\n",
+				status, store.NormalizeProvider(sess.Provider), idShort, relTime, model, prompt)
 		}
 		return nil
 	},
 }
 
 func printSessionsJSON(sessions []store.Session) error {
-	fmt.Println("[")
-	for i, sess := range sessions {
-		active := "false"
-		if sess.Active {
-			active = "true"
-		}
-		fmt.Printf(`  {"id":"%s","project":"%s","active":%s,"model":"%s","last_prompt":"%s","last_activity":%d}`,
-			sess.ID, sess.Project, active, sess.Model, escapeJSON(sess.LastPrompt), sess.LastActivity)
-		if i < len(sessions)-1 {
-			fmt.Println(",")
-		} else {
-			fmt.Println()
-		}
+	type sessionJSON struct {
+		ID               string `json:"id"`
+		Provider         string `json:"provider"`
+		Project          string `json:"project"`
+		Active           bool   `json:"active"`
+		Model            string `json:"model"`
+		LastPrompt       string `json:"last_prompt"`
+		LastActivity     int64  `json:"last_activity"`
+		DetachedAt       *int64 `json:"detached_at,omitempty"`
+		LifecycleEndedAt *int64 `json:"lifecycle_ended_at,omitempty"`
 	}
-	fmt.Println("]")
-	return nil
-}
-
-func escapeJSON(s string) string {
-	var result []byte
-	for _, c := range s {
-		switch c {
-		case '"':
-			result = append(result, '\\', '"')
-		case '\\':
-			result = append(result, '\\', '\\')
-		case '\n':
-			result = append(result, '\\', 'n')
-		case '\r':
-			result = append(result, '\\', 'r')
-		case '\t':
-			result = append(result, '\\', 't')
-		default:
-			result = append(result, byte(c))
-		}
+	output := make([]sessionJSON, 0, len(sessions))
+	for _, sess := range sessions {
+		output = append(output, sessionJSON{
+			ID:               sess.ID,
+			Provider:         store.NormalizeProvider(sess.Provider),
+			Project:          sess.Project,
+			Active:           sess.Active,
+			Model:            sess.Model,
+			LastPrompt:       sess.LastPrompt,
+			LastActivity:     sess.LastActivity,
+			DetachedAt:       sess.DetachedAt,
+			LifecycleEndedAt: sess.LifecycleEndedAt,
+		})
 	}
-	return string(result)
+	encoder := json.NewEncoder(os.Stdout)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(output)
 }
 
 // --- Cleanup Command ---
@@ -636,6 +735,7 @@ var (
 	flagDaemonSocket   string
 	flagDaemonWezDB    string
 	flagDaemonSessions string
+	flagDaemonIdle     time.Duration
 )
 
 var daemonCmd = &cobra.Command{
@@ -654,6 +754,7 @@ Usually started by systemd-user (see ` + "`cst setup-daemon`" + `) or auto-spawn
 			SocketPath:     flagDaemonSocket,
 			WezStorePath:   flagDaemonWezDB,
 			SessionsDBPath: flagDaemonSessions,
+			IdleTimeout:    flagDaemonIdle,
 		})
 		if err != nil {
 			return err
@@ -686,8 +787,10 @@ func init() {
 		"Unix socket path (defaults to $XDG_RUNTIME_DIR/cst-daemon-$UID.sock)")
 	daemonCmd.Flags().StringVar(&flagDaemonWezDB, "wez-db", "",
 		"Path to wezterm.db (defaults to ~/.cst/wezterm.db)")
-	daemonCmd.Flags().StringVar(&flagDaemonSessions, "sessions-db", "",
-		"Path to sessions.db to ATTACH (defaults to ~/.cst/sessions.db if present)")
+	daemonCmd.Flags().StringVar(&flagDaemonSessions, "sessions-db", store.DefaultDBPath(),
+		"Path to sessions.db used for CLI attachment state")
+	daemonCmd.Flags().DurationVar(&flagDaemonIdle, "idle-timeout", daemon.DefaultIdleTimeout,
+		"Exit after this much inactivity (0 disables idle exit)")
 }
 
 // --- Restore Command ---
@@ -712,6 +815,7 @@ wezterm does not expose the original geometry).
 Per-pane spawn command is decided by the replay-command registry:
   - claude (with linked session): ` + "`claude --resume <id>`" + ` plus any configured
     claude args (e.g. --dangerously-skip-permissions)
+  - codex (with linked session): ` + "`codex resume <id>`" + `
   - other registry hit: replays the literal captured command
   - registry miss: opens a plain shell in the saved CWD
 
@@ -968,6 +1072,7 @@ var setupDaemonCmd = &cobra.Command{
 	Long: `Install ~/.config/systemd/user/cst-daemon.service so systemd-user supervises
 the cst daemon. With --enable, also runs:
   systemctl --user enable --now cst-daemon
+  systemctl --user restart cst-daemon
 
 Use --uninstall to disable and remove the service.
 Use --print to print the unit file without writing anything.`,
@@ -999,7 +1104,7 @@ Use --print to print the unit file without writing anything.`,
 			fmt.Printf("Unit file already current: %s\n", res.UnitPath)
 		}
 		if res.Enabled {
-			fmt.Println("Enabled and started cst-daemon (systemd will restart on reboot).")
+			fmt.Println("Enabled and restarted cst-daemon (systemd will start it on reboot).")
 		} else if flagSetupDaemonEnable {
 			fmt.Println("Note: --enable was requested but enable step did not run.")
 		} else {
@@ -1012,7 +1117,7 @@ Use --print to print the unit file without writing anything.`,
 
 func init() {
 	setupDaemonCmd.Flags().BoolVar(&flagSetupDaemonEnable, "enable", false,
-		"Also run `systemctl --user enable --now cst-daemon`")
+		"Enable and restart cst-daemon now")
 	setupDaemonCmd.Flags().BoolVar(&flagSetupDaemonUninstall, "uninstall", false,
 		"Disable and remove the service")
 	setupDaemonCmd.Flags().BoolVar(&flagSetupDaemonPrint, "print", false,
@@ -1028,9 +1133,9 @@ var (
 
 var setupCmd = &cobra.Command{
 	Use:   "setup",
-	Short: "One-shot: shell hooks + wezterm integration + daemon supervision",
-	Long: `Runs setup-shell, setup-wezterm, and (if systemd-user is available) setup-daemon
---enable in sequence. Use --uninstall to reverse all three in one go.
+	Short: "One-shot: Codex hooks + shell hooks + wezterm + daemon supervision",
+	Long: `Runs setup-codex, setup-shell, setup-wezterm, and (if systemd-user is available)
+setup-daemon --enable in sequence. Use --uninstall to reverse all four in one go.
 
 Use --no-systemd to skip the daemon supervision step (wezterm will auto-start
 the daemon on demand instead).`,
@@ -1050,6 +1155,10 @@ the daemon on demand instead).`,
 				_, err = shellsetup.Uninstall(inst)
 				return err
 			})
+			runStep("setup-codex --uninstall", func() error {
+				_, err := codexsetup.Uninstall(codexsetup.Options{})
+				return err
+			})
 			runStep("setup-wezterm --uninstall", func() error {
 				_, err := wezsetup.Uninstall(wezsetup.Options{})
 				return err
@@ -1063,6 +1172,16 @@ the daemon on demand instead).`,
 		}
 
 		// Install.
+		codexResult, err := codexsetup.Install(codexsetup.Options{})
+		if err != nil {
+			return fmt.Errorf("codex hook install: %w", err)
+		}
+		if codexResult.Changed {
+			fmt.Printf("✓ Codex hooks installed → %s\n", codexResult.Path)
+		} else {
+			fmt.Printf("· Codex hooks already current → %s\n", codexResult.Path)
+		}
+
 		inst, err := shellsetup.NewInstallerForShell(detectShell())
 		if err != nil {
 			return fmt.Errorf("shell install: %w", err)
@@ -1106,6 +1225,7 @@ the daemon on demand instead).`,
 		}
 
 		fmt.Println("\nDone. Restart your terminal (or open a new wezterm window) to start using cst.")
+		fmt.Println("In Codex, run /hooks once to review and trust the CST hooks.")
 		return nil
 	},
 }

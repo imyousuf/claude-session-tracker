@@ -15,6 +15,11 @@ build:
 install: build
 	cp $(BUILD_DIR)/$(BINARY) $(GOPATH)/bin/$(BINARY).new
 	mv -f $(GOPATH)/bin/$(BINARY).new $(GOPATH)/bin/$(BINARY)
+	@if command -v systemctl >/dev/null 2>&1 && \
+		(systemctl --user is-enabled --quiet cst-daemon.service || systemctl --user is-active --quiet cst-daemon.service); then \
+		$(GOPATH)/bin/$(BINARY) setup-daemon --enable >/dev/null; \
+		echo "Refreshed and restarted cst-daemon.service with the new binary"; \
+	fi
 
 test:
 	go test -race ./...

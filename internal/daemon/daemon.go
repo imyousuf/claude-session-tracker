@@ -26,17 +26,18 @@ const (
 type Options struct {
 	SocketPath     string
 	WezStorePath   string
-	SessionsDBPath string // optional; if set, ATTACHed for future cross-DB queries
+	SessionsDBPath string // optional; enables provider reconciliation and attachment updates
 	CoalesceWindow time.Duration
-	IdleTimeout    time.Duration
+	IdleTimeout    time.Duration // zero disables idle exit (used under systemd)
 	Logger         *log.Logger
 }
 
 // Daemon owns the wezterm.db connection and serves the per-user event socket.
 type Daemon struct {
-	opts Options
-	w    *store.WezStore
-	log  *log.Logger
+	opts     Options
+	w        *store.WezStore
+	sessions *store.Store
+	log      *log.Logger
 
 	// muxSocketMu guards lastMuxSocket — set from incoming events so that
 	// snapshot runs can derive the mux even when the daemon's own env doesn't
@@ -56,9 +57,6 @@ func New(opts Options) (*Daemon, error) {
 	if opts.CoalesceWindow <= 0 {
 		opts.CoalesceWindow = DefaultCoalesceWindow
 	}
-	if opts.IdleTimeout <= 0 {
-		opts.IdleTimeout = DefaultIdleTimeout
-	}
 	if opts.Logger == nil {
 		opts.Logger = log.New(os.Stderr, "[cst-daemon] ", log.LstdFlags|log.Lmicroseconds)
 	}
@@ -67,19 +65,28 @@ func New(opts Options) (*Daemon, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open wezterm.db: %w", err)
 	}
+	var sessions *store.Store
 	if opts.SessionsDBPath != "" {
-		if _, statErr := os.Stat(opts.SessionsDBPath); statErr == nil {
-			if err := w.AttachSessionsDB(opts.SessionsDBPath); err != nil {
-				opts.Logger.Printf("warn: AttachSessionsDB failed: %v", err)
-			}
+		sessions, err = store.Open(opts.SessionsDBPath)
+		if err != nil {
+			_ = w.Close()
+			return nil, fmt.Errorf("open sessions.db: %w", err)
+		}
+		if err := w.AttachSessionsDB(opts.SessionsDBPath); err != nil {
+			opts.Logger.Printf("warn: AttachSessionsDB failed: %v", err)
 		}
 	}
-	return &Daemon{opts: opts, w: w, log: opts.Logger}, nil
+	return &Daemon{opts: opts, w: w, sessions: sessions, log: opts.Logger}, nil
 }
 
 // Close releases the WezStore connection.
 func (d *Daemon) Close() error {
-	return d.w.Close()
+	var errs []error
+	if d.sessions != nil {
+		errs = append(errs, d.sessions.Close())
+	}
+	errs = append(errs, d.w.Close())
+	return errors.Join(errs...)
 }
 
 // Serve binds the socket and runs the event loop until ctx is canceled,
@@ -161,10 +168,18 @@ func (d *Daemon) eventLoop(ctx context.Context, events <-chan Event, wg *sync.Wa
 	coalesce.Stop()
 	snapshotPending := false
 
-	idle := time.NewTimer(d.opts.IdleTimeout)
-	defer idle.Stop()
+	var idle *time.Timer
+	var idleC <-chan time.Time
+	if d.opts.IdleTimeout > 0 {
+		idle = time.NewTimer(d.opts.IdleTimeout)
+		idleC = idle.C
+		defer idle.Stop()
+	}
 
 	resetIdle := func() {
+		if idle == nil {
+			return
+		}
 		if !idle.Stop() {
 			select {
 			case <-idle.C:
@@ -181,7 +196,7 @@ func (d *Daemon) eventLoop(ctx context.Context, events <-chan Event, wg *sync.Wa
 			wg.Wait()
 			return nil
 
-		case <-idle.C:
+		case <-idleC:
 			d.log.Printf("idle timeout (%s); exiting", d.opts.IdleTimeout)
 			return nil
 
@@ -202,10 +217,7 @@ func (d *Daemon) dispatch(ev Event, pending *bool, coalesce *time.Timer) {
 	switch ev.Type {
 	case EventSnapshotRequest, EventSessionStart, EventSessionEnd:
 		// Schedule a snapshot via the coalesce window.
-		if !*pending {
-			*pending = true
-			coalesce.Reset(d.opts.CoalesceWindow)
-		}
+		d.scheduleSnapshot(pending, coalesce)
 		// SessionStart/End also have their own immediate state writes:
 		if ev.Type == EventSessionStart {
 			d.applySessionStart(ev)
@@ -218,7 +230,9 @@ func (d *Daemon) dispatch(ev Event, pending *bool, coalesce *time.Timer) {
 		d.applyPreexec(ev)
 
 	case EventPrecmd:
-		d.applyPrecmd(ev)
+		if d.applyPrecmd(ev) {
+			d.scheduleSnapshot(pending, coalesce)
+		}
 
 	case EventShutdown:
 		// Best-effort: trigger a final snapshot synchronously, then exit.
@@ -261,13 +275,41 @@ func (d *Daemon) applyPreexec(ev Event) {
 	}
 }
 
-func (d *Daemon) applyPrecmd(ev Event) {
+func (d *Daemon) applyPrecmd(ev Event) bool {
 	if ev.MuxSocket == "" || ev.PaneID == 0 {
-		return
+		return false
 	}
 	d.rememberMuxSocket(ev.MuxSocket)
+	linked, linkedOK, lookupErr := d.w.LookupPaneRuntime(ev.MuxSocket, ev.PaneID)
+	if lookupErr != nil {
+		d.log.Printf("LookupPaneRuntime before precmd: %v", lookupErr)
+	}
 	if err := d.w.ApplyPrecmd(ev.MuxSocket, ev.PaneID, ev.CWD, ev.Timestamp); err != nil {
 		d.log.Printf("ApplyPrecmd: %v", err)
+	}
+	if lookupErr != nil || !linkedOK || linked.SessionID == "" {
+		return false
+	}
+	if d.sessions != nil {
+		detached, err := d.sessions.DetachSession(
+			linked.SessionID, linked.SessionProvider, ev.MuxSocket, ev.PaneID, ev.Timestamp,
+		)
+		if err != nil {
+			d.log.Printf("DetachSession: %v", err)
+		} else if detached {
+			d.log.Printf("session detached: %s/%s from pane %d", linked.SessionProvider, linked.SessionID, ev.PaneID)
+		}
+	}
+	if err := d.w.UnbindSession(ev.MuxSocket, ev.PaneID, linked.SessionProvider, linked.SessionID); err != nil {
+		d.log.Printf("UnbindSession after precmd: %v", err)
+	}
+	return true
+}
+
+func (d *Daemon) scheduleSnapshot(pending *bool, coalesce *time.Timer) {
+	if !*pending {
+		*pending = true
+		coalesce.Reset(d.opts.CoalesceWindow)
 	}
 }
 
@@ -276,8 +318,8 @@ func (d *Daemon) applySessionStart(ev Event) {
 		return
 	}
 	d.rememberMuxSocket(ev.MuxSocket)
-	if err := d.w.BindClaudeSession(ev.MuxSocket, ev.PaneID, ev.SessionID, ev.CWD); err != nil {
-		d.log.Printf("BindClaudeSession: %v", err)
+	if err := d.w.BindSession(ev.MuxSocket, ev.PaneID, ev.Provider, ev.SessionID, ev.CWD); err != nil {
+		d.log.Printf("BindSession: %v", err)
 	}
 }
 
@@ -286,8 +328,8 @@ func (d *Daemon) applySessionEnd(ev Event) {
 		return
 	}
 	d.rememberMuxSocket(ev.MuxSocket)
-	if err := d.w.UnbindClaudeSession(ev.MuxSocket, ev.PaneID); err != nil {
-		d.log.Printf("UnbindClaudeSession: %v", err)
+	if err := d.w.UnbindSession(ev.MuxSocket, ev.PaneID, ev.Provider, ev.SessionID); err != nil {
+		d.log.Printf("UnbindSession: %v", err)
 	}
 }
 

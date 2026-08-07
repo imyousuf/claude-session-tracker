@@ -15,6 +15,7 @@ import (
 // Result holds the outcome of the TUI session picker.
 type Result struct {
 	SessionID string
+	Provider  string
 	Project   string
 }
 
@@ -205,10 +206,19 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		idx := m.filtered[m.cursor]
 		sess := m.sessions[idx]
 		if sess.Active {
-			m.statusMsg = "Cannot resume an active session"
-			return m, nil
+			active, err := m.store.IsSessionActive(sess.ID)
+			if err != nil {
+				m.statusMsg = "Could not refresh session state: " + err.Error()
+				return m, nil
+			}
+			if active {
+				m.statusMsg = "Cannot resume a session attached to another client"
+				return m, nil
+			}
+			m.sessions[idx].Active = false
+			sess.Active = false
 		}
-		m.result = &Result{SessionID: sess.ID, Project: sess.Project}
+		m.result = &Result{SessionID: sess.ID, Provider: sess.Provider, Project: sess.Project}
 		return m, tea.Quit
 
 	case key.Matches(msg, keys.Tab):
@@ -221,7 +231,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			idx := m.filtered[m.cursor]
 			sess := m.sessions[idx]
 			if sess.Active {
-				m.statusMsg = "Cannot delete an active session"
+				m.statusMsg = "Cannot delete a session attached to another client"
 				return m, nil
 			}
 			m.confirming = true
@@ -241,7 +251,7 @@ func (m *Model) buildFilter() {
 	search := strings.ToLower(m.searchText)
 	for i, sess := range m.sessions {
 		if search != "" {
-			text := strings.ToLower(sess.LastPrompt + " " + sess.Project + " " + sess.Model)
+			text := strings.ToLower(store.NormalizeProvider(sess.Provider) + " " + sess.LastPrompt + " " + sess.Project + " " + sess.Model)
 			if !strings.Contains(text, search) {
 				continue
 			}
@@ -266,7 +276,7 @@ func (m Model) View() string {
 	var b strings.Builder
 
 	// Header
-	title := "Claude Code Sessions"
+	title := "Coding Agent Sessions"
 	if !m.showAll && m.project != "" {
 		title += "  " + hintStyle.Render(m.project)
 	} else if m.showAll {
@@ -357,16 +367,20 @@ func (m Model) renderList(width int) string {
 func (m Model) renderSessionLine(sess store.Session, width int) string {
 	var status string
 	if sess.Active {
-		status = activeStatusStyle.Render("● ACTIVE")
+		status = activeStatusStyle.Render("● ATTACHED")
 	} else {
-		status = inactiveStatusStyle.Render("○ idle  ")
+		status = inactiveStatusStyle.Render("○ idle    ")
 	}
 
 	relTime := FormatRelativeTime(sess.LastActivity)
 	model := shortModel(sess.Model)
+	provider := store.NormalizeProvider(sess.Provider)
+	if len(provider) > 6 {
+		provider = provider[:6]
+	}
 
 	// Prompt text gets remaining space
-	promptWidth := width - 10 - 16 - 10 // status + time + model
+	promptWidth := width - 10 - 16 - 8 - 10 // status + time + provider + model
 	if promptWidth < 10 {
 		promptWidth = 10
 	}
@@ -378,9 +392,10 @@ func (m Model) renderSessionLine(sess store.Session, width int) string {
 		prompt = prompt[:promptWidth-3] + "..."
 	}
 
-	return fmt.Sprintf("  %s %s %s %s",
+	return fmt.Sprintf("  %s %s %-6s %s %s",
 		status,
 		timeStyle.Render(relTime),
+		provider,
 		modelStyle.Render(model),
 		promptStyle.Render(prompt),
 	)
@@ -402,11 +417,23 @@ func (m Model) renderPreview(width int) string {
 		idShort = idShort[:8]
 	}
 	lines = append(lines, previewHeaderStyle.Render(fmt.Sprintf("Session %s", idShort)))
+	lines = append(lines, fmt.Sprintf("Agent:   %s", store.NormalizeProvider(sess.Provider)))
 	lines = append(lines, fmt.Sprintf("Project: %s", sess.Project))
 	lines = append(lines, fmt.Sprintf("CWD:     %s", sess.CWD))
 	lines = append(lines, fmt.Sprintf("Model:   %s", sess.Model))
-	lines = append(lines, fmt.Sprintf("Started: %s", formatAbsoluteTime(sess.StartedAt)))
-	lines = append(lines, fmt.Sprintf("Active:  %s", formatAbsoluteTime(sess.LastActivity)))
+	lines = append(lines, fmt.Sprintf("Started:  %s", formatAbsoluteTime(sess.StartedAt)))
+	lines = append(lines, fmt.Sprintf("Last use: %s", formatAbsoluteTime(sess.LastActivity)))
+	status := "idle / resumable"
+	if sess.Active {
+		status = "attached"
+	}
+	lines = append(lines, fmt.Sprintf("Status:   %s", status))
+	if sess.DetachedAt != nil {
+		lines = append(lines, fmt.Sprintf("Detached: %s", formatAbsoluteTime(*sess.DetachedAt)))
+	}
+	if sess.LifecycleEndedAt != nil {
+		lines = append(lines, fmt.Sprintf("Hook end: %s", formatAbsoluteTime(*sess.LifecycleEndedAt)))
+	}
 	lines = append(lines, "")
 
 	// Prompts

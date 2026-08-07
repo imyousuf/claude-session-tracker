@@ -89,9 +89,18 @@ func WritePIDFile() error {
 	return os.WriteFile(path, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600)
 }
 
-// RemovePIDFile deletes the PID file (called on graceful shutdown).
+// RemovePIDFile deletes the daemon PID file on graceful shutdown, but only if
+// it still names this process. During an upgrade, a replacement daemon may
+// already have written its own PID before the old daemon finishes draining.
 func RemovePIDFile() error {
-	err := os.Remove(PIDFilePath())
+	pid, err := ReadPIDFile()
+	if err != nil {
+		return err
+	}
+	if pid != 0 && pid != os.Getpid() {
+		return nil
+	}
+	err = os.Remove(PIDFilePath())
 	if os.IsNotExist(err) {
 		return nil
 	}

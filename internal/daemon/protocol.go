@@ -30,11 +30,11 @@ const (
 	// promotes it to last_command.
 	EventPrecmd EventType = "precmd"
 
-	// EventSessionStart — claude SessionStart hook fired. Binds the pane to
-	// the claude session ID.
+	// EventSessionStart — a coding-agent SessionStart hook fired. Binds the pane
+	// to the provider/session ID.
 	EventSessionStart EventType = "session_start"
 
-	// EventSessionEnd — claude SessionEnd hook fired. Unbinds the pane.
+	// EventSessionEnd — a coding-agent SessionEnd hook fired. Unbinds the pane.
 	EventSessionEnd EventType = "session_end"
 
 	// EventShutdown — graceful shutdown request (used internally and by SIGTERM).
@@ -58,6 +58,7 @@ type Event struct {
 	Timestamp int64  `json:"timestamp,omitempty"` // ms epoch
 
 	// session_start, session_end.
+	Provider  string `json:"provider,omitempty"`
 	SessionID string `json:"session_id,omitempty"`
 	PID       int    `json:"pid,omitempty"`
 }

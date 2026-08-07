@@ -36,6 +36,67 @@ func TestResolveClaudeWithLinkedSessionAppendsClaudeArgs(t *testing.T) {
 	}
 }
 
+func TestResolveCodexWithLinkedSession(t *testing.T) {
+	r := NewResolver([]string{"codex"}, []string{"--dangerously-skip-permissions"})
+	plan := r.Resolve(store.WezPane{
+		CWD:             "/proj",
+		CurrentCmd:      "codex --model gpt-5.4",
+		SessionProvider: store.ProviderCodex,
+		SessionID:       "thr_123",
+	})
+	want := []string{"codex", "resume", "thr_123"}
+	if !reflect.DeepEqual(plan.Command, want) {
+		t.Errorf("command = %v, want %v", plan.Command, want)
+	}
+	if plan.SendLine != "codex resume thr_123" {
+		t.Errorf("SendLine = %q", plan.SendLine)
+	}
+	if plan.Matched != "codex" {
+		t.Errorf("Matched = %q, want codex", plan.Matched)
+	}
+}
+
+func TestResolveCodexHookBeforePreexecResumesLinkedSession(t *testing.T) {
+	r := NewResolver([]string{"codex"}, nil)
+	plan := r.Resolve(store.WezPane{
+		CWD:             "/proj",
+		SessionProvider: store.ProviderCodex,
+		SessionID:       "thr_early",
+	})
+	want := []string{"codex", "resume", "thr_early"}
+	if !reflect.DeepEqual(plan.Command, want) {
+		t.Errorf("command = %v, want %v", plan.Command, want)
+	}
+}
+
+func TestResolveCstLauncherWithLinkedCodexSessionResumes(t *testing.T) {
+	r := NewResolver([]string{"codex"}, nil)
+	plan := r.Resolve(store.WezPane{
+		CWD:             "/proj",
+		CurrentCmd:      "cst",
+		SessionProvider: store.ProviderCodex,
+		SessionID:       "thr_via_cst",
+	})
+	want := []string{"codex", "resume", "thr_via_cst"}
+	if !reflect.DeepEqual(plan.Command, want) {
+		t.Errorf("command = %v, want %v", plan.Command, want)
+	}
+}
+
+func TestSosukeDoesNotUseLinkedProviderResumeWithoutHooks(t *testing.T) {
+	r := NewResolver([]string{"sosuke"}, nil)
+	plan := r.Resolve(store.WezPane{
+		CWD:             "/proj",
+		CurrentCmd:      "sosuke --profile work",
+		SessionProvider: store.ProviderCodex,
+		SessionID:       "thr_stale",
+	})
+	want := []string{"sh", "-c", "exec sosuke --profile work"}
+	if !reflect.DeepEqual(plan.Command, want) {
+		t.Errorf("command = %v, want literal replay %v", plan.Command, want)
+	}
+}
+
 func TestResolveCstLauncherWithLinkedSessionResumes(t *testing.T) {
 	// A pane running Claude via the `cst` wrapper records current_cmd="cst".
 	// `cst` is NOT in the replay registry, but a linked claude_session_id must
@@ -118,6 +179,33 @@ func TestResolveTomoeLiteralReplay(t *testing.T) {
 	want := []string{"sh", "-c", "exec tomoe start --device hw:0,0"}
 	if !reflect.DeepEqual(plan.Command, want) {
 		t.Errorf("command = %v", plan.Command)
+	}
+}
+
+func TestResolveAgentCommandsLiteralReplay(t *testing.T) {
+	r := NewResolver([]string{"codex", "sosuke"}, nil)
+	tests := []struct {
+		name string
+		cmd  string
+	}{
+		{name: "codex", cmd: "codex --model gpt-5.4"},
+		{name: "sosuke", cmd: "sosuke --profile work"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := r.Resolve(store.WezPane{CWD: "/proj", CurrentCmd: tc.cmd})
+			want := []string{"sh", "-c", "exec " + tc.cmd}
+			if !reflect.DeepEqual(plan.Command, want) {
+				t.Errorf("command = %v, want %v", plan.Command, want)
+			}
+			if plan.SendLine != tc.cmd {
+				t.Errorf("SendLine = %q, want %q", plan.SendLine, tc.cmd)
+			}
+			if plan.Matched != tc.name {
+				t.Errorf("Matched = %q, want %q", plan.Matched, tc.name)
+			}
+		})
 	}
 }
 

@@ -104,7 +104,7 @@ type RestoreOptions struct {
 	// SkipFirst is deprecated and ignored. The old gui-startup pre-spawned a
 	// default window and used this to avoid double-spawning; the current
 	// gui-startup uses SpawnIfEmpty instead so the first saved pane (possibly a
-	// claude session) is never dropped.
+	// linked coding-agent session) is never dropped.
 	SkipFirst bool
 
 	// SpawnIfEmpty opens a single default window when the restore would
@@ -150,7 +150,7 @@ const paneReadyPollInterval = 50 * time.Millisecond
 // Pass 1 builds the full window/tab/pane skeleton as plain shells (splitting each
 // pane off its real parent in the stored direction, with a readiness poll so a
 // freshly-spawned pane id is visible before it's used). Pass 2 types each pane's
-// resolved command (claude --resume / literal replay) via send-text.
+// resolved command (provider resume / literal replay) via send-text.
 //
 // Blocks until done (or DryRun, in which case it prints the plan).
 func Restore(ctx context.Context, opts RestoreOptions) (RestoreResult, error) {

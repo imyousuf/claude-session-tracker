@@ -151,6 +151,48 @@ func TestSyncHashSkipsWhenUnchanged(t *testing.T) {
 	}
 }
 
+func TestSyncRuntimeOnlyCodexSessionChangeInvalidatesHash(t *testing.T) {
+	w := openTestWez(t)
+	raw, panes := loadFixture(t)
+	mux := "/run/wezterm/mux"
+	if _, err := Sync(w, raw, panes, mux, time.UnixMilli(1000)); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+
+	// The wezterm layout bytes do not change when Codex emits SessionStart.
+	if err := w.ApplyPreexec(mux, 12, "codex --model gpt-5.4", "/proj", 1100); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.BindSession(mux, 12, store.ProviderCodex, "thr_123", "/proj"); err != nil {
+		t.Fatal(err)
+	}
+	res, err := Sync(w, raw, panes, mux, time.UnixMilli(1200))
+	if err != nil {
+		t.Fatalf("runtime-only sync: %v", err)
+	}
+	if !res.DidWork {
+		t.Fatal("runtime-only provider/session change was incorrectly hash-skipped")
+	}
+
+	var provider, sessionID string
+	if err := w.DB().QueryRow(`
+		SELECT session_provider, session_id FROM terminal_panes WHERE pane_id = 12
+	`).Scan(&provider, &sessionID); err != nil {
+		t.Fatal(err)
+	}
+	if provider != store.ProviderCodex || sessionID != "thr_123" {
+		t.Fatalf("snapshot link = %q/%q, want codex/thr_123", provider, sessionID)
+	}
+
+	res, err = Sync(w, raw, panes, mux, time.UnixMilli(1300))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.DidWork {
+		t.Error("identical layout and runtime state should hash-skip")
+	}
+}
+
 func TestSyncDeletesClosedPanes(t *testing.T) {
 	w := openTestWez(t)
 	raw, panes := loadFixture(t)

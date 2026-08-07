@@ -188,6 +188,62 @@ func TestDaemonSessionEndUnbinds(t *testing.T) {
 	t.Fatal("SessionEnd did not clear claude_session_id within 500ms")
 }
 
+func TestPrecmdDetachesCodexClientBeforeDelayedSessionEnd(t *testing.T) {
+	dir := t.TempDir()
+	mux := "/run/mux"
+	paneID := int64(18)
+	sessionsPath := filepath.Join(dir, "sessions.db")
+	sessions, err := store.Open(sessionsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sessions.UpsertSession(store.Session{
+		ID: "thr_123", Provider: store.ProviderCodex, Project: "/proj", CWD: "/proj",
+		StartedAt: 1, LastActivity: 1, Active: true,
+		ActiveMuxSocket: mux, ActivePaneID: &paneID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_ = sessions.Close()
+
+	fw := &fakeWezterm{response: []byte("[]")}
+	restore := wezterm.SetRunner(fw)
+	defer restore()
+	d, err := New(Options{
+		SocketPath: filepath.Join(dir, "daemon.sock"), WezStorePath: filepath.Join(dir, "wezterm.db"),
+		SessionsDBPath: sessionsPath, CoalesceWindow: 20 * time.Millisecond,
+		IdleTimeout: 5 * time.Second, Logger: log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = d.Close() }()
+	if err := d.w.ApplyPreexec(mux, paneID, "codex resume thr_123", "/proj", 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.w.BindSession(mux, paneID, store.ProviderCodex, "thr_123", "/proj"); err != nil {
+		t.Fatal(err)
+	}
+	cancel := startDaemonGoroutine(t, d)
+	defer cancel()
+	pushTo(t, d.opts.SocketPath, Event{
+		Type: EventPrecmd, MuxSocket: mux, PaneID: paneID, CWD: "/proj", Timestamp: 20,
+	})
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		tracked, listErr := d.sessions.ListAll()
+		runtime, _, runtimeErr := d.w.LookupPaneRuntime(mux, paneID)
+		if listErr == nil && runtimeErr == nil && len(tracked) == 1 &&
+			!tracked[0].Active && tracked[0].DetachedAt != nil && tracked[0].LifecycleEndedAt == nil &&
+			runtime.SessionID == "" {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("precmd did not detach Codex client and clear its pane link")
+}
+
 func TestDaemonRefusesSecondInstanceOnSameSocket(t *testing.T) {
 	d, _, _ := setupDaemon(t, 50*time.Millisecond)
 	cancel := startDaemonGoroutine(t, d)
@@ -255,6 +311,40 @@ func TestDaemonIdleExit(t *testing.T) {
 		// Expected: idle timeout fired and Serve returned.
 	case <-time.After(2 * time.Second):
 		t.Fatal("daemon did not exit on idle timeout within 2s")
+	}
+}
+
+func TestDaemonZeroIdleTimeoutStaysRunning(t *testing.T) {
+	dir := t.TempDir()
+	d, err := New(Options{
+		SocketPath:     filepath.Join(dir, "daemon.sock"),
+		WezStorePath:   filepath.Join(dir, "wezterm.db"),
+		CoalesceWindow: 50 * time.Millisecond,
+		IdleTimeout:    0,
+		Logger:         log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = d.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- d.Serve(ctx) }()
+
+	select {
+	case err := <-done:
+		t.Fatalf("zero-timeout daemon exited early: %v", err)
+	case <-time.After(250 * time.Millisecond):
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve after cancel: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("daemon did not stop after cancellation")
 	}
 }
 

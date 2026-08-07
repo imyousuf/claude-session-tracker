@@ -1,19 +1,25 @@
 package hook
 
 import (
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"os"
 	"strings"
 	"time"
 
+	"github.com/imyousuf/claude-session-tracker/internal/procutil"
 	"github.com/imyousuf/claude-session-tracker/internal/store"
 )
 
 // HookInput represents the JSON payload sent to hook commands via stdin.
 type HookInput struct {
 	SessionID      string `json:"session_id"`
+	Provider       string `json:"-"`
+	AgentPID       int    `json:"-"`
+	MuxSocket      string `json:"-"`
+	PaneID         int64  `json:"-"`
 	TranscriptPath string `json:"transcript_path"`
 	CWD            string `json:"cwd"`
 	PermissionMode string `json:"permission_mode"`
@@ -39,25 +45,41 @@ func ReadInput(r io.Reader) (HookInput, error) {
 // It creates or activates the session in the store.
 func HandleSessionStart(s *store.Store, input HookInput) error {
 	now := time.Now().UnixMilli()
-	pid := os.Getppid()
+	provider := store.NormalizeProvider(input.Provider)
+	var pid *int
+	if input.AgentPID > 0 {
+		trackedPID := input.AgentPID
+		pid = &trackedPID
+	} else if provider != store.ProviderCodex {
+		trackedPID := procutil.FindAgentPID(provider)
+		pid = &trackedPID
+	}
 
 	// Try to activate an existing session first
-	err := s.Activate(input.SessionID, pid, input.Model, input.CWD)
-	if err != nil {
+	err := s.ActivateAttached(input.SessionID, provider, pid, input.Model, input.CWD, input.MuxSocket, input.PaneID)
+	if errors.Is(err, sql.ErrNoRows) {
 		// Session doesn't exist yet — create it
 		sess := store.Session{
-			ID:           input.SessionID,
-			Project:      input.CWD,
-			CWD:          input.CWD,
-			StartedAt:    now,
-			LastActivity: now,
-			PID:          &pid,
-			Active:       true,
-			Model:        input.Model,
+			ID:              input.SessionID,
+			Provider:        provider,
+			Project:         input.CWD,
+			CWD:             input.CWD,
+			StartedAt:       now,
+			LastActivity:    now,
+			PID:             pid,
+			Active:          true,
+			Model:           input.Model,
+			ActiveMuxSocket: input.MuxSocket,
+		}
+		if input.PaneID != 0 {
+			paneID := input.PaneID
+			sess.ActivePaneID = &paneID
 		}
 		if err := s.UpsertSession(sess); err != nil {
 			return fmt.Errorf("upsert session: %w", err)
 		}
+	} else if err != nil {
+		return fmt.Errorf("activate session: %w", err)
 	}
 
 	// Enforce session cap
@@ -96,11 +118,11 @@ func HandlePrompt(s *store.Store, input HookInput) error {
 	return nil
 }
 
-// HandleSessionEnd processes a SessionEnd hook event.
-// It marks the session as inactive.
+// HandleSessionEnd records the provider lifecycle end. The session row remains
+// available to resume; foreground CLI detachment is tracked separately.
 func HandleSessionEnd(s *store.Store, input HookInput) error {
-	if err := s.Deactivate(input.SessionID); err != nil {
-		return fmt.Errorf("deactivate session: %w", err)
+	if err := s.RecordLifecycleEnd(input.SessionID, time.Now().UnixMilli()); err != nil {
+		return fmt.Errorf("end session: %w", err)
 	}
 	return nil
 }

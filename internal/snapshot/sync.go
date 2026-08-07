@@ -37,7 +37,7 @@ type SyncResult struct {
 //     is touched and SyncResult.DidWork is false.
 //   - Otherwise: open a transaction, wipe terminal_windows (cascades), insert
 //     fresh windows/tabs/panes, copy per-pane runtime state (last_cmd,
-//     current_cmd, claude_session_id) from pane_runtime_state into terminal_panes,
+//     current_cmd, provider/session link) from pane_runtime_state into terminal_panes,
 //     prune pane_runtime_state rows for closed panes belonging to muxSocket,
 //     update snapshot_meta, commit.
 //
@@ -46,8 +46,13 @@ type SyncResult struct {
 // instances' rows. Use wezterm.MuxSocket() when calling from inside wezterm.
 func Sync(w *store.WezStore, raw []byte, panes []wezterm.RawPane, muxSocket string, now time.Time) (SyncResult, error) {
 	res := SyncResult{}
-	res.ContentHashHex = hashContent(raw)
 	res.SnapshotTakenAt = now.UnixMilli()
+	tree := buildTree(panes)
+	var err error
+	res.ContentHashHex, err = hashSnapshotContent(raw, w, tree, muxSocket)
+	if err != nil {
+		return res, fmt.Errorf("hash snapshot content: %w", err)
+	}
 
 	prev, hasPrev, err := w.GetSnapshotMeta()
 	if err != nil {
@@ -60,14 +65,12 @@ func Sync(w *store.WezStore, raw []byte, panes []wezterm.RawPane, muxSocket stri
 		return res, nil
 	}
 
-	tree := buildTree(panes)
-
 	// Clobber guard: refuse to overwrite a meaningful saved snapshot with an
 	// empty fresh-start one. When wezterm is restarted, the new (empty) instance
 	// fires a snapshot before `cst restore` can run; without this guard that
 	// empty layout would DELETE the saved windows/tabs/panes — destroying the
 	// very thing restore is supposed to read. The incoming tree carries no
-	// command/claude state for its panes (the daemon hasn't seen any preexec yet
+	// command/session state for its panes (the daemon hasn't seen any preexec yet
 	// on a fresh start), so we detect "smaller AND command-less" and skip.
 	if hasPrev {
 		saved, err := w.GetSnapshotStats()
@@ -132,14 +135,16 @@ func Sync(w *store.WezStore, raw []byte, panes []wezterm.RawPane, muxSocket stri
 						pane_id, tab_id, parent_pane_id, split_direction,
 						size_cols, size_rows, cwd, title,
 						foreground_pid, foreground_name,
-						last_cmd, current_cmd, claude_session_id
-					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)`,
+						last_cmd, current_cmd, session_provider, session_id, claude_session_id
+					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?)`,
 					pane.PaneID, pane.TabID,
 					nullableInt64Ptr(pane.ParentPaneID), nullableString(pane.SplitDirection),
 					pane.SizeCols, pane.SizeRows, pane.CWD, pane.Title,
 					nullableString(rs.LastCommand),
 					nullableString(rs.CurrentCommand),
-					nullableString(rs.ClaudeSessionID),
+					nullableString(rs.SessionProvider),
+					nullableString(rs.SessionID),
+					nullableString(legacyClaudeSessionID(rs)),
 				); err != nil {
 					return res, fmt.Errorf("insert pane %d: %w", pane.PaneID, err)
 				}
@@ -175,9 +180,16 @@ func Sync(w *store.WezStore, raw []byte, panes []wezterm.RawPane, muxSocket stri
 	return res, nil
 }
 
+func legacyClaudeSessionID(state store.PaneRuntimeState) string {
+	if store.NormalizeProvider(state.SessionProvider) == store.ProviderClaude {
+		return state.SessionID
+	}
+	return ""
+}
+
 // incomingStats summarizes a freshly-built tree for the clobber guard. Crucially
 // it joins each incoming pane against pane_runtime_state (under muxSocket) so we
-// can tell whether the incoming snapshot has any live command/claude state. A
+// can tell whether the incoming snapshot has any live command/session state. A
 // freshly-restarted, empty wezterm has none (no preexec seen yet); a live
 // session that just lost a pane still has runtime state on its survivors.
 func incomingStats(w *store.WezStore, tree store.WezTree, muxSocket string) store.SnapshotStats {
@@ -193,11 +205,12 @@ func incomingStats(w *store.WezStore, tree store.WezTree, muxSocket string) stor
 				if err != nil || !ok {
 					continue
 				}
-				if rs.CurrentCommand != "" || rs.LastCommand != "" || rs.ClaudeSessionID != "" {
+				if rs.CurrentCommand != "" || rs.LastCommand != "" || rs.SessionID != "" {
 					s.CommandedPanes++
 				}
-				if rs.ClaudeSessionID != "" {
-					s.ClaudePanes++
+				if rs.SessionID != "" {
+					s.SessionPanes++
+					s.ClaudePanes = s.SessionPanes
 				}
 			}
 		}
@@ -211,8 +224,8 @@ func incomingStats(w *store.WezStore, tree store.WezTree, muxSocket string) stor
 // would otherwise DELETE the saved windows/tabs/panes.
 //
 // Refuse only the unambiguous clobber:
-//   - the saved snapshot carries real state (commands or claude sessions), and
-//   - the incoming snapshot carries NO command/claude state at all (the
+//   - the saved snapshot carries real state (commands or coding sessions), and
+//   - the incoming snapshot carries NO command/session state at all (the
 //     empty-fresh-start signature), and
 //   - the incoming snapshot is strictly smaller than what's saved.
 //
@@ -220,13 +233,20 @@ func incomingStats(w *store.WezStore, tree store.WezTree, muxSocket string) stor
 // its surviving panes still have runtime state, so incoming.CommandedPanes > 0
 // and we allow the write.
 func shouldSkipClobber(saved, incoming store.SnapshotStats) bool {
-	if saved.CommandedPanes == 0 && saved.ClaudePanes == 0 {
+	if saved.CommandedPanes == 0 && linkedPaneCount(saved) == 0 {
 		return false // nothing meaningful saved → always allow
 	}
-	if incoming.CommandedPanes > 0 || incoming.ClaudePanes > 0 {
+	if incoming.CommandedPanes > 0 || linkedPaneCount(incoming) > 0 {
 		return false // incoming has real content → legitimate live update
 	}
 	return incoming.PaneCount < saved.PaneCount
+}
+
+func linkedPaneCount(stats store.SnapshotStats) int {
+	if stats.SessionPanes > stats.ClaudePanes {
+		return stats.SessionPanes
+	}
+	return stats.ClaudePanes
 }
 
 // buildTree groups flat panes from `wezterm cli list` into windows → tabs → panes.
@@ -402,24 +422,48 @@ func abs(n int) int {
 	return n
 }
 
-func hashContent(raw []byte) string {
-	h := sha256.Sum256(raw)
-	return hex.EncodeToString(h[:])
+// hashSnapshotContent includes both wezterm's raw layout and CST's per-pane
+// runtime state. A SessionStart hook can change only the provider/session link
+// while `wezterm cli list` remains byte-for-byte identical; hashing raw layout
+// alone would incorrectly skip that snapshot and lose resumability.
+func hashSnapshotContent(raw []byte, w *store.WezStore, tree store.WezTree, muxSocket string) (string, error) {
+	h := sha256.New()
+	_, _ = h.Write(raw)
+	if muxSocket != "" {
+		for _, win := range tree.Windows {
+			for _, tab := range win.Tabs {
+				for _, pane := range tab.Panes {
+					state, ok, err := w.LookupPaneRuntime(muxSocket, pane.PaneID)
+					if err != nil {
+						return "", err
+					}
+					if !ok {
+						continue
+					}
+					_, _ = fmt.Fprintf(h, "\x00%d\x00%s\x00%d\x00%s\x00%d\x00%s\x00%s\x00%s",
+						pane.PaneID, state.CurrentCommand, state.CurrentStartedAt,
+						state.LastCommand, state.LastFinishedAt, state.CWD,
+						state.SessionProvider, state.SessionID)
+				}
+			}
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // lookupRuntimeInTx reads pane_runtime_state inside an open transaction.
 // Returns zero-value PaneRuntimeState (no error) if the row doesn't exist.
 func lookupRuntimeInTx(tx *sql.Tx, muxSocket string, paneID int64) (store.PaneRuntimeState, error) {
 	var s store.PaneRuntimeState
-	var curCmd, lastCmd, claudeID sql.NullString
+	var curCmd, lastCmd, provider, sessionID sql.NullString
 	var curStarted, lastFinished sql.NullInt64
 	err := tx.QueryRow(`
 		SELECT mux_socket, pane_id, current_command, current_started_at,
-			last_command, last_finished_at, cwd, claude_session_id
+			last_command, last_finished_at, cwd, session_provider, session_id
 		FROM pane_runtime_state WHERE mux_socket = ? AND pane_id = ?
 	`, muxSocket, paneID).Scan(
 		&s.MuxSocket, &s.PaneID,
-		&curCmd, &curStarted, &lastCmd, &lastFinished, &s.CWD, &claudeID,
+		&curCmd, &curStarted, &lastCmd, &lastFinished, &s.CWD, &provider, &sessionID,
 	)
 	if err == sql.ErrNoRows {
 		return store.PaneRuntimeState{}, nil
@@ -433,8 +477,15 @@ func lookupRuntimeInTx(tx *sql.Tx, muxSocket string, paneID int64) (store.PaneRu
 	if lastCmd.Valid {
 		s.LastCommand = lastCmd.String
 	}
-	if claudeID.Valid {
-		s.ClaudeSessionID = claudeID.String
+	if provider.Valid {
+		s.SessionProvider = store.NormalizeProvider(provider.String)
+	}
+	if sessionID.Valid {
+		s.SessionID = sessionID.String
+		s.SessionProvider = store.NormalizeProvider(s.SessionProvider)
+		if s.SessionProvider == store.ProviderClaude {
+			s.ClaudeSessionID = sessionID.String
+		}
 	}
 	if curStarted.Valid {
 		s.CurrentStartedAt = curStarted.Int64

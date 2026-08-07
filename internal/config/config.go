@@ -23,10 +23,11 @@ type Config struct {
 	// ReplayCommands is the allow-list of command names whose last invocation
 	// `cst restore` will re-launch in each pane that was running them. The
 	// captured full command line (including args) is replayed verbatim.
-	// `claude` is a special case: if a session ID is linked to the pane,
-	// `claude --resume <id>` is spawned instead of the literal capture.
+	// Linked Claude and Codex sessions are special cases: restore uses
+	// `claude --resume <id>` or `codex resume <id>` instead of the literal
+	// capture. Commands without lifecycle session links are replayed literally.
 	//
-	// OOTB defaults: "claude", "tomoe". Users can add more with
+	// OOTB defaults: "claude", "codex", "sosuke", "tomoe". Users can add more with
 	// `cst config replay-add <name>` and remove with `replay-remove <name>`.
 	ReplayCommands []string `json:"replay_commands,omitempty"`
 }
@@ -35,7 +36,7 @@ type Config struct {
 // and to merge missing values into an existing config.
 func Defaults() Config {
 	return Config{
-		ReplayCommands: []string{"claude", "tomoe"},
+		ReplayCommands: []string{"claude", "codex", "sosuke", "tomoe"},
 	}
 }
 

@@ -4,8 +4,8 @@ import "github.com/charmbracelet/lipgloss"
 
 var (
 	// Colors
-	activeColor   = lipgloss.Color("#00BFFF") // Cyan for active sessions
-	inactiveColor = lipgloss.Color("#888888") // Gray for inactive
+	activeColor   = lipgloss.Color("#00BFFF") // Cyan for attached sessions
+	inactiveColor = lipgloss.Color("#888888") // Gray for idle sessions
 	selectedBg    = lipgloss.Color("#333366") // Highlight background
 	headerColor   = lipgloss.Color("#FFD700") // Gold for header
 	promptColor   = lipgloss.Color("#AAAAAA") // Light gray for prompts

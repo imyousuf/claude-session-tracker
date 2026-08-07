@@ -29,6 +29,11 @@ type WezPane struct {
 	ForegroundName  string
 	LastCmd         string
 	CurrentCmd      string
+	SessionProvider string
+	SessionID       string
+	// ClaudeSessionID is retained for source compatibility with integrations
+	// built before provider-aware session links. New code should use the two
+	// fields above.
 	ClaudeSessionID string
 }
 
@@ -63,7 +68,9 @@ type PaneRuntimeState struct {
 	LastCommand      string
 	LastFinishedAt   int64
 	CWD              string
-	ClaudeSessionID  string // bound by SessionStart hook; cleared by SessionEnd
+	SessionProvider  string // bound by SessionStart hook; cleared by SessionEnd
+	SessionID        string
+	ClaudeSessionID  string // deprecated compatibility alias
 }
 
 // SnapshotMeta is the single-row snapshot metadata used for hash-skip and debounce.
@@ -111,8 +118,28 @@ func OpenWez(dbPath string) (*WezStore, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("apply wezterm schema: %w", err)
 	}
+	if err := w.migrateSessionColumns(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate wezterm session columns: %w", err)
+	}
 
 	return w, nil
+}
+
+func (w *WezStore) migrateSessionColumns() error {
+	for _, table := range []string{"terminal_panes", "pane_runtime_state"} {
+		for _, column := range []string{"session_provider", "session_id"} {
+			if err := ensureColumn(w.db, table, column, "TEXT"); err != nil {
+				return err
+			}
+		}
+		if _, err := w.db.Exec(`UPDATE ` + table + `
+			SET session_provider = 'claude', session_id = claude_session_id
+			WHERE session_id IS NULL AND claude_session_id IS NOT NULL`); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // OpenWezReadOnly opens wezterm.db for read-only access (used by `cst restore`).
@@ -157,9 +184,8 @@ func (w *WezStore) DB() *sql.DB {
 	return w.db
 }
 
-// AttachSessionsDB attaches a read-only view of sessions.db as "sessions"
-// so the daemon can join terminal_panes.foreground_pid against sessions.pid
-// to derive claude_session_id during snapshot sync.
+// AttachSessionsDB attaches a read-only view of sessions.db as "sessions" so
+// the daemon can reconcile provider/session links written by older versions.
 //
 // Idempotent: safe to call multiple times; subsequent calls re-attach.
 func (w *WezStore) AttachSessionsDB(sessionsDBPath string) error {
@@ -169,21 +195,50 @@ func (w *WezStore) AttachSessionsDB(sessionsDBPath string) error {
 	if err != nil {
 		return fmt.Errorf("attach sessions.db: %w", err)
 	}
+	return w.reconcileAttachedSessionProviders()
+}
+
+// reconcileAttachedSessionProviders corrects pane links written by older
+// daemons that had only claude_session_id. sessions.db is authoritative when a
+// matching ID belongs to Codex (or another future provider).
+func (w *WezStore) reconcileAttachedSessionProviders() error {
+	for _, table := range []string{"terminal_panes", "pane_runtime_state"} {
+		if _, err := w.db.Exec(`UPDATE ` + table + `
+			SET session_provider = (
+				SELECT provider FROM sessions.sessions s WHERE s.id = session_id
+			),
+			claude_session_id = CASE WHEN (
+				SELECT provider FROM sessions.sessions s WHERE s.id = session_id
+			) = 'claude' THEN session_id ELSE NULL END
+			WHERE session_id IS NOT NULL
+			  AND EXISTS (SELECT 1 FROM sessions.sessions s WHERE s.id = session_id)`); err != nil {
+			return fmt.Errorf("reconcile %s session providers: %w", table, err)
+		}
+	}
 	return nil
 }
 
-// LookupClaudeSessionByPID returns the active claude session ID owning the
-// given PID, or empty string if none. Requires AttachSessionsDB to have run.
-func (w *WezStore) LookupClaudeSessionByPID(pid int) (string, error) {
-	var id string
-	err := w.db.QueryRow(
-		`SELECT id FROM sessions.sessions WHERE pid = ? AND active = 1 LIMIT 1`,
+// LookupSessionByPID returns the active coding-agent session owning the given
+// PID. Empty values mean no match. Requires AttachSessionsDB to have run.
+func (w *WezStore) LookupSessionByPID(pid int) (provider, id string, err error) {
+	err = w.db.QueryRow(
+		`SELECT provider, id FROM sessions.sessions WHERE pid = ? AND active = 1 LIMIT 1`,
 		pid,
-	).Scan(&id)
+	).Scan(&provider, &id)
 	if err == sql.ErrNoRows {
-		return "", nil
+		return "", "", nil
 	}
 	if err != nil {
+		return "", "", err
+	}
+	return NormalizeProvider(provider), id, nil
+}
+
+// LookupClaudeSessionByPID is the pre-provider compatibility wrapper. It
+// returns a value only when the owning session is a Claude session.
+func (w *WezStore) LookupClaudeSessionByPID(pid int) (string, error) {
+	provider, id, err := w.LookupSessionByPID(pid)
+	if err != nil || provider != ProviderClaude {
 		return "", err
 	}
 	return id, nil
@@ -210,8 +265,9 @@ func (w *WezStore) GetSnapshotMeta() (SnapshotMeta, bool, error) {
 // be allowed to replace what's saved.
 type SnapshotStats struct {
 	PaneCount      int // total terminal_panes rows
-	CommandedPanes int // panes with current_cmd, last_cmd, or claude_session_id set
-	ClaudePanes    int // panes with a non-NULL claude_session_id
+	CommandedPanes int // panes with current_cmd, last_cmd, or session_id set
+	SessionPanes   int // panes with a linked coding-agent session
+	ClaudePanes    int // deprecated compatibility alias for SessionPanes
 }
 
 // GetSnapshotStats returns counts describing the stored snapshot. A zero-value
@@ -223,13 +279,16 @@ func (w *WezStore) GetSnapshotStats() (SnapshotStats, error) {
 			COUNT(*),
 			COALESCE(SUM(CASE WHEN current_cmd IS NOT NULL
 			                    OR last_cmd IS NOT NULL
+			                    OR session_id IS NOT NULL
 			                    OR claude_session_id IS NOT NULL THEN 1 ELSE 0 END), 0),
-			COALESCE(SUM(CASE WHEN claude_session_id IS NOT NULL THEN 1 ELSE 0 END), 0)
+			COALESCE(SUM(CASE WHEN session_id IS NOT NULL
+			                    OR claude_session_id IS NOT NULL THEN 1 ELSE 0 END), 0)
 		FROM terminal_panes
-	`).Scan(&s.PaneCount, &s.CommandedPanes, &s.ClaudePanes)
+	`).Scan(&s.PaneCount, &s.CommandedPanes, &s.SessionPanes)
 	if err != nil {
 		return SnapshotStats{}, err
 	}
+	s.ClaudePanes = s.SessionPanes
 	return s, nil
 }
 
@@ -253,48 +312,91 @@ func (w *WezStore) TouchSnapshotTimestamp(takenAt int64) error {
 
 // UpsertPaneRuntime replaces a full pane_runtime_state row.
 func (w *WezStore) UpsertPaneRuntime(s PaneRuntimeState) error {
+	if s.SessionID == "" && s.ClaudeSessionID != "" {
+		s.SessionProvider = ProviderClaude
+		s.SessionID = s.ClaudeSessionID
+	}
+	if s.SessionID != "" {
+		s.SessionProvider = NormalizeProvider(s.SessionProvider)
+	}
 	_, err := w.db.Exec(`
 		INSERT INTO pane_runtime_state
-			(mux_socket, pane_id, current_command, current_started_at, last_command, last_finished_at, cwd, claude_session_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			(mux_socket, pane_id, current_command, current_started_at, last_command, last_finished_at, cwd, session_provider, session_id, claude_session_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(mux_socket, pane_id) DO UPDATE SET
 			current_command    = excluded.current_command,
 			current_started_at = excluded.current_started_at,
 			last_command       = excluded.last_command,
 			last_finished_at   = excluded.last_finished_at,
 			cwd                = excluded.cwd,
+			session_provider   = excluded.session_provider,
+			session_id         = excluded.session_id,
 			claude_session_id  = excluded.claude_session_id
 	`,
 		s.MuxSocket, s.PaneID,
 		nullableString(s.CurrentCommand), nullableInt64(s.CurrentStartedAt),
 		nullableString(s.LastCommand), nullableInt64(s.LastFinishedAt),
-		s.CWD, nullableString(s.ClaudeSessionID),
+		s.CWD, nullableString(s.SessionProvider), nullableString(s.SessionID),
+		nullableString(claudeSessionID(s.SessionProvider, s.SessionID)),
 	)
 	return err
 }
 
-// BindClaudeSession sets claude_session_id on the pane_runtime_state row for
-// the given (mux_socket, pane_id). Called by SessionStart hook. CWD is required
-// so we can create the row if it doesn't already exist.
-func (w *WezStore) BindClaudeSession(muxSocket string, paneID int64, sessionID, cwd string) error {
-	_, err := w.db.Exec(`
-		INSERT INTO pane_runtime_state (mux_socket, pane_id, cwd, claude_session_id)
-		VALUES (?, ?, ?, ?)
+// BindSession links a coding-agent session to a pane. CWD is required so the
+// SessionStart hook can create the runtime row before a shell preexec arrives.
+func (w *WezStore) BindSession(muxSocket string, paneID int64, provider, sessionID, cwd string) error {
+	provider = NormalizeProvider(provider)
+	tx, err := w.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	// A session can only be attached to one client pane. This also repairs
+	// legacy Codex links created from the app-server's stale WEZTERM_PANE.
+	if _, err := tx.Exec(`
+		UPDATE pane_runtime_state
+		SET session_provider = NULL, session_id = NULL, claude_session_id = NULL
+		WHERE session_provider = ? AND session_id = ?
+		  AND NOT (mux_socket = ? AND pane_id = ?)
+	`, provider, sessionID, muxSocket, paneID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO pane_runtime_state (mux_socket, pane_id, cwd, session_provider, session_id, claude_session_id)
+		VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT(mux_socket, pane_id) DO UPDATE SET
+			session_provider = excluded.session_provider,
+			session_id       = excluded.session_id,
 			claude_session_id = excluded.claude_session_id,
-			cwd               = excluded.cwd
-	`, muxSocket, paneID, cwd, sessionID)
+			cwd              = excluded.cwd
+	`, muxSocket, paneID, cwd, provider, sessionID,
+		nullableString(claudeSessionID(provider, sessionID))); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// BindClaudeSession is the pre-provider compatibility wrapper.
+func (w *WezStore) BindClaudeSession(muxSocket string, paneID int64, sessionID, cwd string) error {
+	return w.BindSession(muxSocket, paneID, ProviderClaude, sessionID, cwd)
+}
+
+// UnbindSession clears a provider/session link. Matching the session id keeps a
+// delayed SessionEnd event from clearing a newer session in the same pane.
+func (w *WezStore) UnbindSession(muxSocket string, paneID int64, provider, sessionID string) error {
+	_, err := w.db.Exec(`
+		UPDATE pane_runtime_state
+		SET session_provider = NULL, session_id = NULL, claude_session_id = NULL
+		WHERE mux_socket = ? AND pane_id = ?
+		  AND session_provider = ?
+		  AND (? = '' OR session_id = ?)
+	`, muxSocket, paneID, NormalizeProvider(provider), sessionID, sessionID)
 	return err
 }
 
-// UnbindClaudeSession clears claude_session_id on the pane_runtime_state row
-// for the given (mux_socket, pane_id). Called by SessionEnd hook.
+// UnbindClaudeSession is the pre-provider compatibility wrapper.
 func (w *WezStore) UnbindClaudeSession(muxSocket string, paneID int64) error {
-	_, err := w.db.Exec(`
-		UPDATE pane_runtime_state SET claude_session_id = NULL
-		WHERE mux_socket = ? AND pane_id = ?
-	`, muxSocket, paneID)
-	return err
+	return w.UnbindSession(muxSocket, paneID, ProviderClaude, "")
 }
 
 // ApplyPreexec sets current_command and cwd; called from `cst hook preexec`.
@@ -351,15 +453,15 @@ func (w *WezStore) ApplyPrecmd(muxSocket string, paneID int64, cwd string, finis
 // LookupPaneRuntime returns the runtime state for a pane. ok=false if not tracked.
 func (w *WezStore) LookupPaneRuntime(muxSocket string, paneID int64) (PaneRuntimeState, bool, error) {
 	var s PaneRuntimeState
-	var curCmd, lastCmd, claudeID sql.NullString
+	var curCmd, lastCmd, provider, sessionID sql.NullString
 	var curStarted, lastFinished sql.NullInt64
 	err := w.db.QueryRow(`
 		SELECT mux_socket, pane_id, current_command, current_started_at,
-			last_command, last_finished_at, cwd, claude_session_id
+			last_command, last_finished_at, cwd, session_provider, session_id
 		FROM pane_runtime_state WHERE mux_socket = ? AND pane_id = ?
 	`, muxSocket, paneID).Scan(
 		&s.MuxSocket, &s.PaneID,
-		&curCmd, &curStarted, &lastCmd, &lastFinished, &s.CWD, &claudeID,
+		&curCmd, &curStarted, &lastCmd, &lastFinished, &s.CWD, &provider, &sessionID,
 	)
 	if err == sql.ErrNoRows {
 		return PaneRuntimeState{}, false, nil
@@ -379,8 +481,15 @@ func (w *WezStore) LookupPaneRuntime(muxSocket string, paneID int64) (PaneRuntim
 	if lastFinished.Valid {
 		s.LastFinishedAt = lastFinished.Int64
 	}
-	if claudeID.Valid {
-		s.ClaudeSessionID = claudeID.String
+	if provider.Valid {
+		s.SessionProvider = NormalizeProvider(provider.String)
+	}
+	if sessionID.Valid {
+		s.SessionID = sessionID.String
+		s.SessionProvider = NormalizeProvider(s.SessionProvider)
+		if s.SessionProvider == ProviderClaude {
+			s.ClaudeSessionID = sessionID.String
+		}
 	}
 	return s, true, nil
 }
@@ -507,14 +616,38 @@ func (w *WezStore) ReadTree() (WezTree, error) {
 	}
 	_ = tabRows.Close()
 
-	// 3. Panes (grouped by tab).
-	paneRows, err := w.db.Query(`
+	// 3. Panes (grouped by tab). Read-only restore may be the first command run
+	// after upgrading CST, so tolerate the old schema without requiring a write
+	// migration first.
+	hasProvider, err := tableHasColumn(w.db, "terminal_panes", "session_provider")
+	if err != nil {
+		return tree, fmt.Errorf("inspect pane session provider column: %w", err)
+	}
+	hasSessionID, err := tableHasColumn(w.db, "terminal_panes", "session_id")
+	if err != nil {
+		return tree, fmt.Errorf("inspect pane session id column: %w", err)
+	}
+	paneQuery := `
 		SELECT pane_id, tab_id, parent_pane_id, split_direction,
 			size_cols, size_rows, cwd, title, foreground_pid, foreground_name,
-			last_cmd, current_cmd, claude_session_id
+			last_cmd, current_cmd,
+			COALESCE(session_provider, CASE WHEN claude_session_id IS NOT NULL THEN 'claude' END),
+			COALESCE(session_id, claude_session_id)
 		FROM terminal_panes
 		ORDER BY tab_id, pane_id
-	`)
+	`
+	if !hasProvider || !hasSessionID {
+		paneQuery = `
+			SELECT pane_id, tab_id, parent_pane_id, split_direction,
+				size_cols, size_rows, cwd, title, foreground_pid, foreground_name,
+				last_cmd, current_cmd,
+				CASE WHEN claude_session_id IS NOT NULL THEN 'claude' END,
+				claude_session_id
+			FROM terminal_panes
+			ORDER BY tab_id, pane_id
+		`
+	}
+	paneRows, err := w.db.Query(paneQuery)
 	if err != nil {
 		return tree, fmt.Errorf("query panes: %w", err)
 	}
@@ -522,12 +655,12 @@ func (w *WezStore) ReadTree() (WezTree, error) {
 	for paneRows.Next() {
 		var p WezPane
 		var parent sql.NullInt64
-		var split, title, fgName, lastCmd, currentCmd, claudeID sql.NullString
+		var split, title, fgName, lastCmd, currentCmd, provider, sessionID sql.NullString
 		var fgPID sql.NullInt64
 		if err := paneRows.Scan(
 			&p.PaneID, &p.TabID, &parent, &split,
 			&p.SizeCols, &p.SizeRows, &p.CWD, &title, &fgPID, &fgName,
-			&lastCmd, &currentCmd, &claudeID,
+			&lastCmd, &currentCmd, &provider, &sessionID,
 		); err != nil {
 			_ = paneRows.Close()
 			return tree, err
@@ -555,8 +688,15 @@ func (w *WezStore) ReadTree() (WezTree, error) {
 		if currentCmd.Valid {
 			p.CurrentCmd = currentCmd.String
 		}
-		if claudeID.Valid {
-			p.ClaudeSessionID = claudeID.String
+		if provider.Valid {
+			p.SessionProvider = NormalizeProvider(provider.String)
+		}
+		if sessionID.Valid {
+			p.SessionID = sessionID.String
+			p.SessionProvider = NormalizeProvider(p.SessionProvider)
+			if p.SessionProvider == ProviderClaude {
+				p.ClaudeSessionID = sessionID.String
+			}
 		}
 		panesByTab[p.TabID] = append(panesByTab[p.TabID], p)
 	}
@@ -592,4 +732,11 @@ func nullableInt64(i int64) any {
 		return nil
 	}
 	return i
+}
+
+func claudeSessionID(provider, sessionID string) string {
+	if NormalizeProvider(provider) == ProviderClaude {
+		return sessionID
+	}
+	return ""
 }

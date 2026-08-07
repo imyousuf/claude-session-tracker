@@ -58,12 +58,18 @@ func TestSaveCreatesDirectory(t *testing.T) {
 	}
 }
 
-func TestDefaultsHasClaudeAndTomoe(t *testing.T) {
+func TestDefaultsHasSupportedAgentCommands(t *testing.T) {
 	d := Defaults()
-	if len(d.ReplayCommands) != 2 {
-		t.Fatalf("expected 2 OOTB commands, got %d", len(d.ReplayCommands))
+	want := []string{"claude", "codex", "sosuke", "tomoe"}
+	if len(d.ReplayCommands) != len(want) {
+		t.Fatalf("expected %d OOTB commands, got %d", len(want), len(d.ReplayCommands))
 	}
-	if d.ReplayCommands[0] != "claude" || d.ReplayCommands[1] != "tomoe" {
+	for i := range want {
+		if d.ReplayCommands[i] != want[i] {
+			t.Errorf("ReplayCommands[%d] = %q, want %q", i, d.ReplayCommands[i], want[i])
+		}
+	}
+	if t.Failed() {
 		t.Errorf("OOTB list = %v", d.ReplayCommands)
 	}
 }
@@ -71,7 +77,7 @@ func TestDefaultsHasClaudeAndTomoe(t *testing.T) {
 func TestWithDefaultsFillsNil(t *testing.T) {
 	c := Config{} // ReplayCommands is nil
 	got := c.WithDefaults()
-	if len(got.ReplayCommands) != 2 {
+	if len(got.ReplayCommands) != 4 {
 		t.Errorf("WithDefaults didn't fill nil: %v", got.ReplayCommands)
 	}
 }
@@ -100,11 +106,11 @@ func TestAddReplayCommand(t *testing.T) {
 	if added := c.AddReplayCommand("ssh"); !added {
 		t.Error("expected true when adding new")
 	}
-	if len(c.ReplayCommands) != 3 {
+	if len(c.ReplayCommands) != 5 {
 		t.Fatalf("len = %d", len(c.ReplayCommands))
 	}
-	if c.ReplayCommands[2] != "ssh" {
-		t.Errorf("last = %q", c.ReplayCommands[2])
+	if c.ReplayCommands[4] != "ssh" {
+		t.Errorf("last = %q", c.ReplayCommands[4])
 	}
 }
 
@@ -113,15 +119,17 @@ func TestRemoveReplayCommand(t *testing.T) {
 	if removed := c.RemoveReplayCommand("tomoe"); !removed {
 		t.Error("expected true when removing existing")
 	}
-	if len(c.ReplayCommands) != 1 || c.ReplayCommands[0] != "claude" {
+	if len(c.ReplayCommands) != 3 || c.ReplayCommands[0] != "claude" {
 		t.Errorf("after remove: %v", c.ReplayCommands)
 	}
 	if removed := c.RemoveReplayCommand("nope"); removed {
 		t.Error("expected false when removing missing")
 	}
 
-	// Remove the last entry → list becomes empty (not nil).
+	// Remove the remaining entries → list becomes empty (not nil).
 	c.RemoveReplayCommand("claude")
+	c.RemoveReplayCommand("codex")
+	c.RemoveReplayCommand("sosuke")
 	if c.ReplayCommands == nil {
 		t.Error("ReplayCommands should be empty slice, not nil, after last removal")
 	}
@@ -143,7 +151,7 @@ func TestSaveLoadReplayCommandsRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if len(loaded.ReplayCommands) != 3 {
+	if len(loaded.ReplayCommands) != 5 {
 		t.Fatalf("len = %d", len(loaded.ReplayCommands))
 	}
 }

@@ -69,3 +69,24 @@ func TestPIDFileRoundtrip(t *testing.T) {
 		t.Errorf("after remove pid = %d", pid)
 	}
 }
+
+func TestRemovePIDFilePreservesReplacementDaemonPID(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	path := PIDFilePath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	replacementPID := os.Getpid() + 1
+	if err := os.WriteFile(path, []byte(strconv.Itoa(replacementPID)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := RemovePIDFile(); err != nil {
+		t.Fatalf("RemovePIDFile: %v", err)
+	}
+	pid, err := ReadPIDFile()
+	if err != nil || pid != replacementPID {
+		t.Fatalf("replacement pid file changed: pid=%d err=%v", pid, err)
+	}
+}

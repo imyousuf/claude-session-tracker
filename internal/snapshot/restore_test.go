@@ -248,6 +248,51 @@ func TestRestoreSkeletonThenSendText(t *testing.T) {
 	}
 }
 
+func TestRestoreLinkedCodexSession(t *testing.T) {
+	dir := t.TempDir()
+	wezPath := filepath.Join(dir, "wezterm.db")
+	w, err := store.OpenWez(wezPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := "/run/mux"
+	panes := []wezterm.RawPane{{
+		WindowID: 1, TabID: 1, PaneID: 1, Workspace: "default",
+		CWD: "file://host/proj/", Size: wezterm.Size{Cols: 100, Rows: 30},
+	}}
+	// The normal picker path execs Codex from the `cst` process, so the shell
+	// records `cst` while the provider/session link identifies Codex.
+	if err := w.ApplyPreexec(mux, 1, "cst", "/proj", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.BindSession(mux, 1, store.ProviderCodex, "thr_123", "/proj"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Sync(w, []byte("codex-pane"), panes, mux, time.UnixMilli(1000)); err != nil {
+		t.Fatal(err)
+	}
+	_ = w.Close()
+
+	f := newFakeSpawner()
+	res, err := Restore(context.Background(), testOpts(RestoreOptions{
+		WezDBPath: wezPath,
+		Spawner:   f,
+		Replay:    []string{"codex"},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.CommandsSent != 1 {
+		t.Fatalf("CommandsSent = %d, want 1", res.CommandsSent)
+	}
+	for _, call := range f.calls {
+		if call.Kind == "send-text" && call.Text == "codex resume thr_123\r" {
+			return
+		}
+	}
+	t.Fatalf("missing Codex resume send-text; calls = %+v", f.calls)
+}
+
 // TestRestoreTomoeSplitChain is the headline regression: a 3-pane tab
 // (A full-height left, B top-right, C bottom-right) must rebuild as
 // lead A → split B right off A → split C bottom off B, with claude/tomoe

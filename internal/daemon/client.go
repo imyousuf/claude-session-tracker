@@ -83,19 +83,43 @@ func inlineFallback(ev Event, dialErr error) error {
 		if ev.MuxSocket == "" || ev.PaneID == 0 {
 			return nil
 		}
-		return w.ApplyPrecmd(ev.MuxSocket, ev.PaneID, ev.CWD, ev.Timestamp)
+		linked, linkedOK, err := w.LookupPaneRuntime(ev.MuxSocket, ev.PaneID)
+		if err != nil {
+			return err
+		}
+		if err := w.ApplyPrecmd(ev.MuxSocket, ev.PaneID, ev.CWD, ev.Timestamp); err != nil {
+			return err
+		}
+		if !linkedOK || linked.SessionID == "" {
+			return nil
+		}
+		sessions, err := store.Open(store.DefaultDBPath())
+		if err != nil {
+			return err
+		}
+		_, detachErr := sessions.DetachSession(
+			linked.SessionID, linked.SessionProvider, ev.MuxSocket, ev.PaneID, ev.Timestamp,
+		)
+		closeErr := sessions.Close()
+		if detachErr != nil {
+			return detachErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		return w.UnbindSession(ev.MuxSocket, ev.PaneID, linked.SessionProvider, linked.SessionID)
 
 	case EventSessionStart:
 		if ev.MuxSocket == "" || ev.PaneID == 0 || ev.SessionID == "" {
 			return nil
 		}
-		return w.BindClaudeSession(ev.MuxSocket, ev.PaneID, ev.SessionID, ev.CWD)
+		return w.BindSession(ev.MuxSocket, ev.PaneID, ev.Provider, ev.SessionID, ev.CWD)
 
 	case EventSessionEnd:
 		if ev.MuxSocket == "" || ev.PaneID == 0 {
 			return nil
 		}
-		return w.UnbindClaudeSession(ev.MuxSocket, ev.PaneID)
+		return w.UnbindSession(ev.MuxSocket, ev.PaneID, ev.Provider, ev.SessionID)
 	}
 	return nil
 }

@@ -46,7 +46,7 @@ func TestInstallWritesUnitWithBinaryPath(t *testing.T) {
 	}
 
 	body, _ := os.ReadFile(res.UnitPath)
-	if !strings.Contains(string(body), "ExecStart=/usr/local/bin/cst daemon") {
+	if !strings.Contains(string(body), "ExecStart=/usr/local/bin/cst daemon --idle-timeout=0") {
 		t.Errorf("unit missing absolute ExecStart:\n%s", body)
 	}
 	if !strings.Contains(string(body), "MemoryMax=64M") {
@@ -103,9 +103,12 @@ func TestInstallEnableNow(t *testing.T) {
 	if !res.Enabled {
 		t.Error("expected Enabled=true")
 	}
-	// Expect: daemon-reload, then enable --now.
-	if len(*calls) != 2 {
-		t.Fatalf("expected 2 systemctl calls, got %d", len(*calls))
+	if !res.Restarted {
+		t.Error("expected Restarted=true")
+	}
+	// Expect: daemon-reload, enable --now, then restart to load the new binary.
+	if len(*calls) != 3 {
+		t.Fatalf("expected 3 systemctl calls, got %d", len(*calls))
 	}
 	wantEnable := []string{"--user", "enable", "--now", "cst-daemon.service"}
 	got := (*calls)[1].args
@@ -115,6 +118,16 @@ func TestInstallEnableNow(t *testing.T) {
 	for i := range got {
 		if got[i] != wantEnable[i] {
 			t.Errorf("enable args[%d] = %q, want %q", i, got[i], wantEnable[i])
+		}
+	}
+	wantRestart := []string{"--user", "restart", "cst-daemon.service"}
+	got = (*calls)[2].args
+	if len(got) != len(wantRestart) {
+		t.Fatalf("restart args = %v", got)
+	}
+	for i := range got {
+		if got[i] != wantRestart[i] {
+			t.Errorf("restart args[%d] = %q, want %q", i, got[i], wantRestart[i])
 		}
 	}
 }

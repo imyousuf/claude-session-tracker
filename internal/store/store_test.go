@@ -1,11 +1,162 @@
 package store
 
 import (
+	"database/sql"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestSessionsIncludeProviderAndOrderAcrossCLIs(t *testing.T) {
+	s := testStore(t)
+	now := time.Now().UnixMilli()
+	for _, sess := range []Session{
+		{ID: "claude-1", Provider: ProviderClaude, Project: "/proj", CWD: "/proj", StartedAt: now, LastActivity: now, Model: "sonnet"},
+		{ID: "codex-1", Provider: ProviderCodex, Project: "/proj", CWD: "/proj", StartedAt: now + 1, LastActivity: now + 1000, Model: "gpt-5.4"},
+	} {
+		if err := s.UpsertSession(sess); err != nil {
+			t.Fatalf("UpsertSession(%s): %v", sess.Provider, err)
+		}
+	}
+	sessions, err := s.ListAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 2 {
+		t.Fatalf("sessions = %d, want 2", len(sessions))
+	}
+	if sessions[0].Provider != ProviderCodex || sessions[0].ID != "codex-1" {
+		t.Errorf("first session = %+v, want most-recent Codex session", sessions[0])
+	}
+	if sessions[1].Provider != ProviderClaude {
+		t.Errorf("second provider = %q, want claude", sessions[1].Provider)
+	}
+}
+
+func TestCodexDetachIsSeparateFromLifecycleEnd(t *testing.T) {
+	s := testStore(t)
+	now := time.Now().UnixMilli()
+	paneID := int64(18)
+	if err := s.UpsertSession(Session{
+		ID: "codex-1", Provider: ProviderCodex, Project: "/proj", CWD: "/proj",
+		StartedAt: now, LastActivity: now, Active: true,
+		ActiveMuxSocket: "/run/mux", ActivePaneID: &paneID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	detached, err := s.DetachSession("codex-1", ProviderCodex, "/run/mux", paneID, now+100)
+	if err != nil || !detached {
+		t.Fatalf("DetachSession: detached=%v err=%v", detached, err)
+	}
+	sessions, err := s.ListAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := sessions[0]
+	if got.Active || got.DetachedAt == nil || *got.DetachedAt != now+100 {
+		t.Fatalf("detached session state = %+v", got)
+	}
+	if got.LifecycleEndedAt != nil {
+		t.Fatalf("CLI detach incorrectly recorded lifecycle end at %d", *got.LifecycleEndedAt)
+	}
+
+	if err := s.RecordLifecycleEnd("codex-1", now+200); err != nil {
+		t.Fatal(err)
+	}
+	sessions, _ = s.ListAll()
+	if sessions[0].LifecycleEndedAt == nil || *sessions[0].LifecycleEndedAt != now+200 {
+		t.Fatalf("LifecycleEndedAt = %v, want %d", sessions[0].LifecycleEndedAt, now+200)
+	}
+}
+
+func TestStalePaneCannotDetachResumedSession(t *testing.T) {
+	s := testStore(t)
+	now := time.Now().UnixMilli()
+	if err := s.UpsertSession(Session{
+		ID: "codex-1", Provider: ProviderCodex, Project: "/proj", CWD: "/proj",
+		StartedAt: now, LastActivity: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ActivateAttached("codex-1", ProviderCodex, nil, "gpt", "/proj", "/run/new", 22); err != nil {
+		t.Fatal(err)
+	}
+	detached, err := s.DetachSession("codex-1", ProviderCodex, "/run/old", 18, now+100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detached {
+		t.Fatal("stale pane detached a session resumed in another pane")
+	}
+	active, err := s.IsSessionActive("codex-1")
+	if err != nil || !active {
+		t.Fatalf("active=%v err=%v, want active", active, err)
+	}
+}
+
+func TestRefreshActiveUsesCodexFrontendPID(t *testing.T) {
+	s := testStore(t)
+	now := time.Now().UnixMilli()
+	frontendPID := 4242
+	if err := s.UpsertSession(Session{
+		ID: "codex-1", Provider: ProviderCodex, Project: "/proj", CWD: "/proj",
+		StartedAt: now, LastActivity: now, PID: &frontendPID, Active: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RefreshActive(func(pid int) bool { return pid == frontendPID }); err != nil {
+		t.Fatal(err)
+	}
+	active, err := s.IsSessionActive("codex-1")
+	if err != nil || !active {
+		t.Fatalf("live Codex frontend was invalidated: active=%v err=%v", active, err)
+	}
+	if err := s.RefreshActive(func(int) bool { return false }); err != nil {
+		t.Fatal(err)
+	}
+	active, err = s.IsSessionActive("codex-1")
+	if err != nil || active {
+		t.Fatalf("dead Codex frontend remained active: active=%v err=%v", active, err)
+	}
+}
+
+func TestOpenMigratesLegacySessionsToClaudeProvider(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		CREATE TABLE sessions (
+			id TEXT PRIMARY KEY, project TEXT NOT NULL, cwd TEXT NOT NULL,
+			started_at INTEGER NOT NULL, last_activity INTEGER NOT NULL,
+			pid INTEGER, active INTEGER DEFAULT 0, model TEXT DEFAULT ''
+		);
+		INSERT INTO sessions (id, project, cwd, started_at, last_activity)
+		VALUES ('legacy', '/proj', '/proj', 1, 2);
+	`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open migrated DB: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	sessions, err := s.ListAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 1 || sessions[0].Provider != ProviderClaude {
+		t.Fatalf("migrated sessions = %+v, want legacy row with claude provider", sessions)
+	}
+}
 
 func testStore(t *testing.T) *Store {
 	t.Helper()

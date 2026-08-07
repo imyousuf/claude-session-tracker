@@ -1,16 +1,21 @@
-# Claude Session Tracker (CST)
+# Coding Session Tracker (CST)
 
-A Claude Code plugin that tracks your sessions and provides an interactive TUI launcher to browse and resume previous sessions.
+A session tracker for Claude Code and Codex CLI with an interactive TUI for
+browsing and resuming sessions from either agent.
 
 ## Features
 
-- **Session tracking** via Claude Code lifecycle hooks (SessionStart, UserPromptSubmit, SessionEnd)
+- **Multi-agent session tracking** via Claude Code and Codex lifecycle hooks
+  (`SessionStart`, `UserPromptSubmit`, and `SessionEnd`)
 - **Prompt history** - stores the last 10 user prompts per session for context
 - **Interactive TUI** with search, preview pane, and keyboard navigation
-- **Active session detection** - identifies and filters currently-running sessions
+- **Client attachment detection** - distinguishes attached sessions from
+  idle, resumable threads
 - **Cross-platform** - pure Go binary, no CGO required
-- **Concurrent-safe** - SQLite WAL mode handles multiple simultaneous Claude sessions
-- **Wezterm layout snapshot + restore** *(optional)* - captures your wezterm windows/tabs/CWDs on every meaningful event; re-launches the same layout (with `claude --resume` for the panes that had claude running) on the next wezterm start. See [Wezterm Integration](#wezterm-integration).
+- **Concurrent-safe** - SQLite WAL mode handles simultaneous sessions from multiple agents
+- **Wezterm layout snapshot + restore** *(optional)* - captures windows, tabs,
+  CWDs, and linked agent sessions; restores them with `claude --resume <id>` or
+  `codex resume <id>`. See [Wezterm Integration](#wezterm-integration).
 
 ## Installation
 
@@ -34,7 +39,9 @@ cd claude-session-tracker
 make install  # installs to $GOPATH/bin
 ```
 
-### 2. Enable the plugin
+### 2. Enable lifecycle hooks
+
+For Claude Code, enable the plugin:
 
 Clone the repo (if not done already) and enable it in Claude Code:
 
@@ -43,6 +50,17 @@ git clone https://github.com/imyousuf/claude-session-tracker.git ~/projects/clau
 ```
 
 Then in Claude Code, use `/plugin` to add and enable `session-tracker`.
+
+For Codex CLI, merge CST's hooks into your user configuration:
+
+```bash
+cst setup-codex
+```
+
+Start Codex, run `/hooks`, and review and trust the three CST command hooks.
+Codex requires explicit trust before non-managed hooks run. The installer
+preserves any existing hooks in `$CODEX_HOME/hooks.json` (normally
+`~/.codex/hooks.json`). See the [official Codex Hooks guide](https://learn.chatgpt.com/codex/hooks).
 
 ## Usage
 
@@ -81,15 +99,29 @@ cst version                  # Show version info
 
 ## How It Works
 
-CST uses three Claude Code lifecycle hooks:
+CST uses the lifecycle hooks from Claude Code and Codex CLI together with the
+shell integration:
 
-1. **SessionStart** - Records the session as active with its project path, model, and PID
+1. **SessionStart** - Records the session and marks its CLI client as attached
 2. **UserPromptSubmit** - Captures the user's prompt (skipping slash commands) and updates activity timestamp
-3. **SessionEnd** - Marks the session as inactive
+3. **Shell precmd** - Runs as soon as the foreground CLI exits, marks the client
+   detached, and makes the session resumable in CST
+4. **SessionEnd** - Records the separate provider lifecycle end without deleting
+   the resumable session
 
-Session data is stored in `~/.cst/sessions.db` (SQLite with WAL mode).
+For Codex these last two moments are intentionally different. Switching away
+or detaching a connected client can leave the thread open, and `SessionEnd` may
+not run until the thread has no connected client for 30 minutes. CST uses
+the shell exit for the immediate `attached`/`idle` status and stores the later
+lifecycle event separately. See the [official Codex Hooks guide](https://learn.chatgpt.com/docs/hooks#sessionend).
 
-When launching the TUI, CST validates active sessions by checking if their PIDs are still alive, automatically cleaning up stale entries from crashed sessions.
+Session data is stored in `~/.cst/sessions.db` with a `provider` field. The TUI
+and `cst list` combine all providers and order them by most recent activity.
+
+When launching the TUI, CST validates the interactive CLI process for both
+providers. Because Codex hooks run under a long-lived app-server, CST resolves
+the actual terminal-backed Codex frontend and its wezterm pane instead of
+trusting the hook process environment.
 
 ## Architecture
 
@@ -97,15 +129,16 @@ When launching the TUI, CST validates active sessions by checking if their PIDs 
 cmd/cst/             CLI entry point (cobra)
 internal/
   store/             SQLite session store (modernc.org/sqlite, pure Go)
-                     - sessions.db: claude session tracking (existing)
+                     - sessions.db: provider-aware coding sessions
                      - wezterm.db:  wezterm layout snapshot (new; daemon-owned)
   hook/              Hook event handlers (read stdin JSON, update store)
   launcher/          Bubbletea TUI (session list + preview pane)
-  procutil/          Cross-platform process liveness checking
+  procutil/          PID liveness checking for PID-backed providers
   daemon/            Per-user snapshot daemon (Unix socket, event loop, coalesce)
   snapshot/          Snapshot sync + restore logic + replay-command resolver
   wezterm/           `wezterm cli list/spawn/split-pane` wrapper
   shellsetup/        Install shell hooks into ~/.bashrc / .zshrc / fish config
+  codexsetup/        Merge CST lifecycle hooks into ~/.codex/hooks.json
   wezsetup/          Install wezterm Lua integration
   daemonsetup/       Install systemd-user service for the daemon
 ```
@@ -118,7 +151,7 @@ event and restores it on the next wezterm start.
 ### Quick start
 
 ```bash
-cst setup --all     # installs shell hooks + wezterm Lua + (if systemd-user) daemon
+cst setup           # Codex hooks + shell hooks + wezterm + optional systemd daemon
 ```
 
 Then restart your terminal (or open a new wezterm window). Done.
@@ -127,11 +160,12 @@ What gets installed:
 
 | File | Purpose |
 |---|---|
+| `$CODEX_HOME/hooks.json` | Merge-safe Codex lifecycle hook configuration. |
 | `~/.bashrc` (or `.zshrc`, fish config) | A marker-fenced block that registers per-prompt hooks. |
 | `~/.cst/bash-preexec.sh` | Downloaded `rcaloras/bash-preexec` helper (bash only; zsh/fish use native hooks). Pinned version, verified by SHA. |
 | `~/.config/wezterm/cst.lua` | Event handlers (`gui-startup`, `new-tab-button-click`, `mux-is-process-stateful`, `window-focus-changed`) and snapshot-on-keybinding wrappers. |
 | `~/.wezterm.lua` | A short loader block (between markers) that `require`s `cst.lua`. |
-| `~/.config/systemd/user/cst-daemon.service` | systemd unit (if `cst setup --all` detected systemd-user). |
+| `~/.config/systemd/user/cst-daemon.service` | systemd unit (when `cst setup` detects systemd-user). |
 | `~/.cst/wezterm.db` | The daemon's snapshot DB (separate from `sessions.db`). |
 | `$XDG_RUNTIME_DIR/cst-daemon-$UID.sock` | The daemon's per-user Unix socket. |
 
@@ -160,13 +194,13 @@ Restore is the only command that ever blocks on real work.
 
 ### Two databases — why split
 
-- `~/.cst/sessions.db` (existing) — claude session metadata + prompt history.
+- `~/.cst/sessions.db` — Claude/Codex session metadata + prompt history.
   Single writer: the `cst hook` commands. Single reader: the TUI.
 - `~/.cst/wezterm.db` (new) — wezterm tree snapshot + per-pane runtime state.
   Single writer: the cst daemon. Single reader: `cst restore` (read-only).
 
 Splitting by writer eliminates contention; uninstalling the wezterm integration
-removes only `wezterm.db` (your claude sessions are untouched).
+removes only `wezterm.db` (tracked coding sessions are untouched).
 
 ### bash-preexec dependency
 
@@ -178,13 +212,17 @@ the rc-file block. Zsh and fish have native hooks, so no extra download.
 
 ### Replay-command registry
 
-Out of the box, two commands are replayed on restore: **`claude`** and **`tomoe`**.
+Out of the box, four commands are replayed on restore: **`claude`**, **`codex`**,
+**`sosuke`**, and **`tomoe`**.
 For each captured pane, on `cst restore`:
 
 | Pane state | Result |
 |---|---|
 | `last_cmd` starts with `claude` AND a session ID is linked | spawn `claude --resume <id>` |
 | `last_cmd` starts with `claude` (no linked session) | spawn the literal capture, e.g. `claude --some-flag` |
+| `last_cmd` starts with `codex` AND a Codex session ID is linked | spawn `codex resume <id>` |
+| `last_cmd` starts with `codex` (no linked session) | spawn the captured literal with its full arguments |
+| `last_cmd` starts with `sosuke` | spawn the captured literal; Sosuke has no lifecycle-hook session link yet |
 | `last_cmd` starts with `tomoe` (or any registered command) | spawn the captured literal (full args) |
 | `last_cmd` not in registry (e.g. `vim`, `ssh`, `htop`) | open a plain shell in the saved CWD |
 | Nothing was captured for the pane | open a plain shell |
@@ -202,7 +240,7 @@ so `FOO=1 tomoe start --device hw:0,0` matches `tomoe`.
 
 ### Daemon supervision
 
-Preferred: **systemd-user**, installed automatically by `cst setup --all`
+Preferred: **systemd-user**, installed automatically by `cst setup`
 when available:
 
 ```bash
@@ -213,8 +251,9 @@ journalctl --user -u cst-daemon -f       # follow logs
 Fallback: **wezterm-auto-start** + **client-side auto-spawn**. The wezterm
 `gui-startup` hook starts the daemon if it's not running. The shell-side push
 clients (`cst snapshot`, `cst hook preexec`, etc.) also auto-spawn the daemon
-if their first socket connect fails. The daemon self-exits after 30 minutes
-of no events; the next event re-spawns it.
+if their first socket connect fails. Standalone daemons self-exit after 30
+minutes of no events; systemd-managed daemons disable idle exit and remain
+supervised.
 
 ### Multi-user
 
@@ -228,25 +267,31 @@ Two users on the same machine each see only their own terminals.
 
 ### Verification checklist
 
-After `cst setup --all`:
+After `cst setup` and trusting the Codex hooks with `/hooks`:
 
 1. `cst daemon-status` → `reachable: true`.
 2. `ls -l ~/.cst/` → both `sessions.db` and `wezterm.db` present, mode `0600`.
-3. Open wezterm; open 2-3 tabs with different commands (e.g. `claude`, `tomoe`).
-4. Wait ~200 ms; `sqlite3 ~/.cst/wezterm.db 'SELECT pane_id, cwd, current_cmd, claude_session_id FROM terminal_panes;'` → confirm rows.
+3. Open wezterm; start Claude and Codex in separate tabs.
+4. Wait ~200 ms; `sqlite3 ~/.cst/wezterm.db 'SELECT pane_id, cwd, current_cmd, session_provider, session_id FROM terminal_panes;'` → confirm linked rows.
 5. `cst restore --dry-run` → prints the planned `wezterm cli` calls.
 6. Quit wezterm, re-launch → layout reconstructed.
+
+When upgrading an already-running installation, both `cst setup` and a source
+`make install` refresh and restart an enabled systemd user daemon—even if the
+service was inactive when installation began. If you replace the binary another
+way, restart it explicitly with `systemctl --user restart cst-daemon`.
 
 ### Uninstall
 
 ```bash
-cst setup --uninstall      # reverses everything: shell hooks, wezterm Lua, systemd
+cst setup --uninstall      # reverses Codex hooks, shell hooks, wezterm Lua, systemd
 ```
 
 Or piecemeal:
 
 ```bash
 cst setup-shell --uninstall
+cst setup-codex --uninstall
 cst setup-wezterm --uninstall
 cst setup-daemon --uninstall
 ```

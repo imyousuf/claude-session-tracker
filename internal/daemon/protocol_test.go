@@ -12,8 +12,8 @@ func TestEventRoundTrip(t *testing.T) {
 		{Type: EventSnapshotRequest},
 		{Type: EventPreexec, MuxSocket: "/run/mux", PaneID: 5, Command: "tomoe start", CWD: "/tmp", Timestamp: 1000},
 		{Type: EventPrecmd, MuxSocket: "/run/mux", PaneID: 5, CWD: "/tmp/sub", Timestamp: 2000},
-		{Type: EventSessionStart, MuxSocket: "/run/mux", PaneID: 7, SessionID: "sess-abc", PID: 12345, CWD: "/tmp/proj"},
-		{Type: EventSessionEnd, MuxSocket: "/run/mux", PaneID: 7, SessionID: "sess-abc"},
+		{Type: EventSessionStart, MuxSocket: "/run/mux", PaneID: 7, Provider: "codex", SessionID: "thr_abc", PID: 12345, CWD: "/tmp/proj"},
+		{Type: EventSessionEnd, MuxSocket: "/run/mux", PaneID: 7, Provider: "codex", SessionID: "thr_abc"},
 	}
 	for _, ev := range cases {
 		t.Run(string(ev.Type), func(t *testing.T) {

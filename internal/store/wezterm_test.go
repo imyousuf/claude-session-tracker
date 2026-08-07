@@ -1,9 +1,125 @@
 package store
 
 import (
+	"database/sql"
 	"path/filepath"
 	"testing"
 )
+
+func TestOpenWezMigratesLegacyClaudeSessionColumns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy-wezterm.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		CREATE TABLE snapshot_meta (id INTEGER PRIMARY KEY, taken_at INTEGER NOT NULL, content_hash TEXT NOT NULL);
+		CREATE TABLE terminal_windows (window_id INTEGER PRIMARY KEY, workspace TEXT NOT NULL, win_index INTEGER NOT NULL);
+		CREATE TABLE terminal_tabs (tab_id INTEGER PRIMARY KEY, window_id INTEGER NOT NULL, tab_index INTEGER NOT NULL);
+		CREATE TABLE terminal_panes (
+			pane_id INTEGER PRIMARY KEY, tab_id INTEGER NOT NULL, parent_pane_id INTEGER,
+			split_direction TEXT, size_cols INTEGER NOT NULL, size_rows INTEGER NOT NULL,
+			cwd TEXT NOT NULL, title TEXT, foreground_pid INTEGER, foreground_name TEXT,
+			last_cmd TEXT, current_cmd TEXT, claude_session_id TEXT
+		);
+		CREATE TABLE pane_runtime_state (
+			mux_socket TEXT NOT NULL, pane_id INTEGER NOT NULL, current_command TEXT,
+			current_started_at INTEGER, last_command TEXT, last_finished_at INTEGER,
+			cwd TEXT NOT NULL, claude_session_id TEXT,
+			PRIMARY KEY (mux_socket, pane_id)
+		);
+		INSERT INTO pane_runtime_state (mux_socket, pane_id, cwd, claude_session_id)
+		VALUES ('/run/mux', 7, '/proj', 'legacy-session');
+	`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := OpenWez(path)
+	if err != nil {
+		t.Fatalf("OpenWez legacy DB: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+	state, ok, err := w.LookupPaneRuntime("/run/mux", 7)
+	if err != nil || !ok {
+		t.Fatalf("LookupPaneRuntime: ok=%v err=%v", ok, err)
+	}
+	if state.SessionProvider != ProviderClaude || state.SessionID != "legacy-session" {
+		t.Fatalf("migrated link = %q/%q", state.SessionProvider, state.SessionID)
+	}
+
+	// An old daemon could also have written a Codex thread into the legacy
+	// Claude-only column. Once sessions.db is attached, its provider wins.
+	sessionsPath := filepath.Join(filepath.Dir(path), "sessions.db")
+	sessions, err := Open(sessionsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sessions.UpsertSession(Session{
+		ID: "legacy-session", Provider: ProviderCodex, Project: "/proj", CWD: "/proj",
+		StartedAt: 1, LastActivity: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_ = sessions.Close()
+	if err := w.AttachSessionsDB(sessionsPath); err != nil {
+		t.Fatal(err)
+	}
+	state, _, err = w.LookupPaneRuntime("/run/mux", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.SessionProvider != ProviderCodex || state.SessionID != "legacy-session" || state.ClaudeSessionID != "" {
+		t.Fatalf("reconciled link = provider=%q id=%q legacy=%q", state.SessionProvider, state.SessionID, state.ClaudeSessionID)
+	}
+}
+
+func TestOpenWezReadOnlyReadsLegacyClaudeSessionColumns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy-readonly-wezterm.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		CREATE TABLE snapshot_meta (id INTEGER PRIMARY KEY, taken_at INTEGER NOT NULL, content_hash TEXT NOT NULL);
+		CREATE TABLE terminal_windows (window_id INTEGER PRIMARY KEY, workspace TEXT NOT NULL, win_index INTEGER NOT NULL);
+		CREATE TABLE terminal_tabs (tab_id INTEGER PRIMARY KEY, window_id INTEGER NOT NULL, tab_index INTEGER NOT NULL);
+		CREATE TABLE terminal_panes (
+			pane_id INTEGER PRIMARY KEY, tab_id INTEGER NOT NULL, parent_pane_id INTEGER,
+			split_direction TEXT, size_cols INTEGER NOT NULL, size_rows INTEGER NOT NULL,
+			cwd TEXT NOT NULL, title TEXT, foreground_pid INTEGER, foreground_name TEXT,
+			last_cmd TEXT, current_cmd TEXT, claude_session_id TEXT
+		);
+		INSERT INTO terminal_windows VALUES (1, 'default', 0);
+		INSERT INTO terminal_tabs VALUES (2, 1, 0);
+		INSERT INTO terminal_panes (
+			pane_id, tab_id, size_cols, size_rows, cwd, current_cmd, claude_session_id
+		) VALUES (3, 2, 80, 24, '/proj', 'claude', 'legacy-session');
+	`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := OpenWezReadOnly(path)
+	if err != nil {
+		t.Fatalf("OpenWezReadOnly legacy DB: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+	tree, err := w.ReadTree()
+	if err != nil {
+		t.Fatalf("ReadTree legacy DB: %v", err)
+	}
+	pane := tree.Windows[0].Tabs[0].Panes[0]
+	if pane.SessionProvider != ProviderClaude || pane.SessionID != "legacy-session" {
+		t.Fatalf("legacy read-only link = %q/%q", pane.SessionProvider, pane.SessionID)
+	}
+}
 
 func testWezStore(t *testing.T) *WezStore {
 	t.Helper()
@@ -360,6 +476,64 @@ func TestAttachSessionsDBAndLookupClaudeSessionByPID(t *testing.T) {
 	}
 	if id != "" {
 		t.Fatalf("expected empty, got %q", id)
+	}
+}
+
+func TestBindAndUnbindCodexSession(t *testing.T) {
+	w := testWezStore(t)
+	if err := w.BindSession("/run/mux", 7, ProviderCodex, "thr_123", "/proj"); err != nil {
+		t.Fatalf("BindSession: %v", err)
+	}
+	state, ok, err := w.LookupPaneRuntime("/run/mux", 7)
+	if err != nil || !ok {
+		t.Fatalf("LookupPaneRuntime: ok=%v err=%v", ok, err)
+	}
+	if state.SessionProvider != ProviderCodex || state.SessionID != "thr_123" {
+		t.Fatalf("session link = %q/%q, want codex/thr_123", state.SessionProvider, state.SessionID)
+	}
+	if state.ClaudeSessionID != "" {
+		t.Errorf("legacy ClaudeSessionID = %q for Codex link", state.ClaudeSessionID)
+	}
+
+	// A stale end event must not clear a newer session link.
+	if err := w.UnbindSession("/run/mux", 7, ProviderCodex, "thr_old"); err != nil {
+		t.Fatal(err)
+	}
+	state, _, _ = w.LookupPaneRuntime("/run/mux", 7)
+	if state.SessionID != "thr_123" {
+		t.Fatal("stale SessionEnd cleared the active Codex session")
+	}
+	if err := w.UnbindSession("/run/mux", 7, ProviderCodex, "thr_123"); err != nil {
+		t.Fatal(err)
+	}
+	state, _, _ = w.LookupPaneRuntime("/run/mux", 7)
+	if state.SessionID != "" || state.SessionProvider != "" {
+		t.Fatalf("session link remains after matching end: %+v", state)
+	}
+}
+
+func TestBindSessionMovesExistingAttachmentToNewPane(t *testing.T) {
+	w := testWezStore(t)
+	if err := w.BindSession("/run/mux", 18, ProviderCodex, "thr_123", "/wrong"); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.BindSession("/run/mux", 4, ProviderCodex, "thr_123", "/project"); err != nil {
+		t.Fatal(err)
+	}
+
+	old, _, err := w.LookupPaneRuntime("/run/mux", 18)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if old.SessionProvider != "" || old.SessionID != "" {
+		t.Fatalf("old pane still linked: %+v", old)
+	}
+	current, ok, err := w.LookupPaneRuntime("/run/mux", 4)
+	if err != nil || !ok {
+		t.Fatalf("new pane lookup: ok=%v err=%v", ok, err)
+	}
+	if current.SessionProvider != ProviderCodex || current.SessionID != "thr_123" {
+		t.Fatalf("new pane link = %+v", current)
 	}
 }
 

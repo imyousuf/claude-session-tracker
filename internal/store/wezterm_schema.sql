@@ -3,7 +3,7 @@
 -- See ~/.claude/plans/sunny-strolling-locket.md for the design rationale,
 -- especially: single-snapshot sync (not multi-gen), pane_runtime_state as a
 -- buffer between async shell hooks and periodic snapshots, and the
--- ATTACH-based cross-DB join to sessions.db for claude_session_id.
+-- ATTACH-based cross-DB join to sessions.db for linked coding-agent sessions.
 
 CREATE TABLE IF NOT EXISTS snapshot_meta (
     id           INTEGER PRIMARY KEY CHECK (id = 1),
@@ -38,6 +38,10 @@ CREATE TABLE IF NOT EXISTS terminal_panes (
     foreground_name   TEXT,
     last_cmd          TEXT,
     current_cmd       TEXT,
+    session_provider  TEXT,
+    session_id        TEXT,
+    -- Legacy compatibility column. Existing databases are migrated into the
+    -- provider-aware fields when opened.
     claude_session_id TEXT
 );
 
@@ -52,9 +56,12 @@ CREATE TABLE IF NOT EXISTS pane_runtime_state (
     last_command       TEXT,
     last_finished_at   INTEGER,
     cwd                TEXT NOT NULL,
-    -- Set by cst's SessionStart hook (which has $WEZTERM_PANE in env);
-    -- cleared by SessionEnd. Sync copies this into terminal_panes.claude_session_id
-    -- so restore can spawn `claude --resume <id>` for the linked pane.
+    -- Set by cst's SessionStart hook (which has $WEZTERM_PANE in env) and
+    -- cleared by SessionEnd. Sync copies these into terminal_panes so restore
+    -- can invoke the provider-specific resume command.
+    session_provider   TEXT,
+    session_id         TEXT,
+    -- Legacy compatibility column; see terminal_panes above.
     claude_session_id  TEXT,
     PRIMARY KEY (mux_socket, pane_id)
 );

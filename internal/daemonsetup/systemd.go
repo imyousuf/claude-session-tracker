@@ -23,7 +23,7 @@ After=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=%s daemon
+ExecStart=%s daemon --idle-timeout=0
 Restart=on-failure
 RestartSec=5s
 # The daemon is intentionally tiny; cap its blast radius.
@@ -45,7 +45,8 @@ type Options struct {
 	CstBin string
 	// SystemctlBin overrides "systemctl" (for tests).
 	SystemctlBin string
-	// EnableNow runs `systemctl --user enable --now cst-daemon` after install.
+	// EnableNow enables and restarts cst-daemon after install so an already
+	// running service cannot keep executing an older cst binary.
 	EnableNow bool
 }
 
@@ -55,6 +56,7 @@ type Result struct {
 	Wrote        bool // true if the unit file content changed
 	DaemonReload bool // true if we ran systemctl --user daemon-reload
 	Enabled      bool // true if we ran enable --now
+	Restarted    bool // true if we restarted the service after enabling it
 }
 
 func defaultedOptions(o Options) (Options, error) {
@@ -116,6 +118,10 @@ func Install(o Options) (Result, error) {
 			return res, fmt.Errorf("systemctl enable --now: %w", err)
 		}
 		res.Enabled = true
+		if err := runSystemctl(o.SystemctlBin, "--user", "restart", ServiceName); err != nil {
+			return res, fmt.Errorf("systemctl restart: %w", err)
+		}
+		res.Restarted = true
 	}
 	return res, nil
 }
